@@ -9,5 +9,8 @@ urlpatterns = [
     path('api/', include('campusos.urls')),   # lowercase app
 ]
 
+admin.site.site_header = "campusOs Administration"
+admin.site.site_title = "campusOs Admin"
+admin.site.index_title = "Welcome to campusOs Control Panel"
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
