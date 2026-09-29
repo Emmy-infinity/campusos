@@ -275,5 +275,8 @@ LOGGING = {
     },
 }
 
+
+CORS_ALLOW_ALL = True
+
 AUTH_USER_MODEL = "campusos.User"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
