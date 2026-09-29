@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: productlistingapi
+    env: python
+    region: ohio
+    plan: free
+    buildCommand: pip install -r requirements.txt && python manage.py migrate --noinput && python manage.py collectstatic --noinput
+    startCommand: gunicorn myproject.wsgi:application --bind 0.0.0.0:${PORT:-10000} --workers 1 --timeout 30
+    envVars:
+      - key: DEBUG
+        value: "False"
+      - key: ALLOWED_HOSTS
+        value: "productlistingapi.onrender.com,*.render.com,localhost,127.0.0.1"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: SECRET_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
