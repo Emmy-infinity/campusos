@@ -181,6 +181,11 @@ class DocumentQuerySet(models.QuerySet):
         return self.select_related('uploaded_by', 'course')
 
 
+
+
+
+# campusos/models.py
+from cloudinary_storage.storage import RawMediaCloudinaryStorage
 class Document(models.Model):
     class Category(models.TextChoices):
         NOTE = 'NOTE', 'Note'
@@ -197,7 +202,7 @@ class Document(models.Model):
 
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
-    file = models.FileField(upload_to='documents/%Y/%m/%d/')
+    file = models.FileField( upload_to="documents/%Y/%m/%d/",storage=RawMediaCloudinaryStorage(),)
     uploaded_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
