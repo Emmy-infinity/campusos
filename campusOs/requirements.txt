@@ -17,3 +17,4 @@ gunicorn
 Pillow
 whitenoise==6.7.0
 django-unfold==0.45.0
+celery
