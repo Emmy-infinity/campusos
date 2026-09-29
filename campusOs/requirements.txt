@@ -18,3 +18,10 @@ Pillow
 whitenoise==6.7.0
 django-unfold==0.45.0
 celery
+# Add any that are missing from your requirements.txt:
+openai
+
+requests
+celery
+redis
+
