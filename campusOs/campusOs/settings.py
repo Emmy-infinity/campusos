@@ -1,5 +1,5 @@
 """
-Django settings for olailongmarket project (development – based on production branch).
+Django settings for campusOs project.
 """
 
 import os
@@ -21,24 +21,39 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.getenv("SECRET_KEY", "django-insecure-fallback-key-change-me")
 DEBUG = os.getenv("DEBUG", "True") == "True"
 
+# Specific hosts instead of wildcard — safer
 ALLOWED_HOSTS = [
-   '*'
+    "localhost",
+    "127.0.0.1",
+    "campusos-0ju0.onrender.com",
+    ".onrender.com",          # allows any *.onrender.com host
 ]
 
-# ─── CORS & CSRF (UPDATED) ──────────────────────────────────────────
-# Read frontend URL from environment, fallback to the PWA URL
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://olailongmarket-pwa.onrender.com")
+# ─── CORS & CSRF ─────────────────────────────────────────────────────
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://olailongfrontend.onrender.com")
 
 CORS_ALLOWED_ORIGINS = [
+    # Local development
     "http://localhost:3000",
     "http://localhost:5173",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
-    "https://olailongfrontend.onrender.com",   # ✅ ADDED – your actual frontend
+    # Deployed frontends
+    "https://olailongfrontend.onrender.com",
+    "https://olailongmarket-pwa.onrender.com",
+    "https://campusos-0ju0.onrender.com",
     FRONTEND_URL,
 ]
 
-# Explicitly allow common headers – fixes many CORS issues
+# Allow any *.onrender.com subdomain (covers future deploys)
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://.*\.onrender\.com$",
+]
+
+# For quick debugging only — set CORS_ALLOW_ALL=True in Render env to enable
+if os.getenv("CORS_ALLOW_ALL", "False") == "True":
+    CORS_ALLOW_ALL_ORIGINS = True
+
 CORS_ALLOW_HEADERS = [
     "accept",
     "accept-encoding",
@@ -52,15 +67,20 @@ CORS_ALLOW_HEADERS = [
 ]
 
 CORS_ALLOW_CREDENTIALS = True
+CORS_EXPOSE_HEADERS = ["Content-Type", "X-CSRFToken"]
 
-# 🔓 For DEBUG only – uncomment to allow all origins (temporary testing)
-# CORS_ALLOW_ALL_ORIGINS = True   # ⚠️ Remove for production
-
-CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS + [
-    "https://olailongmarket-backend.onrender.com",
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+    "https://olailongfrontend.onrender.com",
+    "https://olailongmarket-pwa.onrender.com",
+    "https://campusos-0ju0.onrender.com",
+    "https://*.onrender.com",
 ]
 
-# ─── Security Settings for Production (only applied when DEBUG=False) ──
+# ─── Production Security (only when DEBUG=False) ─────────────────────
 if not DEBUG:
     SECURE_SSL_REDIRECT = True
     CSRF_COOKIE_SECURE = True
@@ -69,8 +89,9 @@ if not DEBUG:
     SECURE_HSTS_SECONDS = 31536000
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
+    SECURE_REFERRER_POLICY = "same-origin"
 
-# ─── REST Framework & JWT ───────────────────────────────────────────
+# ─── REST Framework & JWT ────────────────────────────────────────────
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
@@ -95,7 +116,7 @@ SIMPLE_JWT = {
     "UPDATE_LAST_LOGIN": False,
 }
 
-# ─── Installed Apps ────────────────────────────────────────────────────
+# ─── Installed Apps ──────────────────────────────────────────────────
 INSTALLED_APPS = [
     "unfold",
     "unfold.contrib.filters",
@@ -114,11 +135,11 @@ INSTALLED_APPS = [
     "campusos",
 ]
 
-# ─── Middleware ────────────────────────────────────────────────────
+# ─── Middleware ──────────────────────────────────────────────────────
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.gzip.GZipMiddleware",
-    "corsheaders.middleware.CorsMiddleware",   # ✅ Correct position
+    "corsheaders.middleware.CorsMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -148,24 +169,21 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "campusOs.wsgi.application"
 
-# ─── Database ──────────────────────────────────────────────────────
-# ─── FIXED FOR RENDER ──────────────────────────────────────────────
-# ─── Database ──────────────────────────────────────────────────────
+# ─── Database ────────────────────────────────────────────────────────
 DATABASES = {
     "default": dj_database_url.config(
         default=f"sqlite:///{os.path.join(BASE_DIR, 'db.sqlite3')}",
         conn_max_age=0,
         conn_health_checks=True,
-        # NOTE: Do NOT put ssl_require=True here. It breaks SQLite fallback.
     )
 }
 
-# Only apply Postgres-specific SSL settings when actually using Postgres
 if DATABASES["default"]["ENGINE"] == "django.db.backends.postgresql":
     DATABASES["default"].setdefault("OPTIONS", {})
     DATABASES["default"]["OPTIONS"]["sslmode"] = "require"
     DATABASES["default"]["OPTIONS"]["connect_timeout"] = 10
-# ─── Password Validation ──────────────────────────────────────────
+
+# ─── Password Validation ─────────────────────────────────────────────
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
@@ -173,13 +191,13 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
 
-# ─── Internationalization ──────────────────────────────────────────
+# ─── Internationalization ────────────────────────────────────────────
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "Africa/Kampala"
 USE_I18N = True
 USE_TZ = True
 
-# ─── Static & Media ────────────────────────────────────────────────
+# ─── Static & Media ──────────────────────────────────────────────────
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = "/media/"
@@ -200,27 +218,29 @@ WHITENOISE_USE_FINDERS = True
 WHITENOISE_AUTOREFRESH = DEBUG
 WHITENOISE_MAX_AGE = 31536000 if not DEBUG else 0
 
-# ─── Cloudinary ────────────────────────────────────────────────────
+# ─── Cloudinary ──────────────────────────────────────────────────────
+# ⚠️ SECURITY: No hardcoded fallbacks for secrets.
+# Set these as environment variables in Render.
 cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", "dtll1o9u0"),
-    api_key=os.getenv("CLOUDINARY_API_KEY", "387833656525477"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET", "AmTSvrVHKiLlN2ArzFgctGx_-70"),
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
     secure=True,
 )
 
 CLOUDINARY_STORAGE = {
-    "CLOUD_NAME": os.getenv("CLOUDINARY_CLOUD_NAME", "dtll1o9u0"),
-    "API_KEY": os.getenv("CLOUDINARY_API_KEY", "387833656525477"),
-    "API_SECRET": os.getenv("CLOUDINARY_API_SECRET", "AmTSvrVHKiLlN2ArzFgctGx_-70"),
+    "CLOUD_NAME": os.getenv("CLOUDINARY_CLOUD_NAME"),
+    "API_KEY": os.getenv("CLOUDINARY_API_KEY"),
+    "API_SECRET": os.getenv("CLOUDINARY_API_SECRET"),
 }
 
-# ─── Flutterwave ──────────────────────────────────────────────────
+# ─── Flutterwave ─────────────────────────────────────────────────────
 FLW_SECRET_KEY = os.getenv("FLUTTERWAVE_SECRET_KEY", "")
 FLW_SECRET_HASH = os.getenv("FLUTTERWAVE_WEBHOOK_SECRET_HASH", "")
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 
-# ─── Caching ──────────────────────────────────────────────────────
+# ─── Caching ─────────────────────────────────────────────────────────
 CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
@@ -228,7 +248,7 @@ CACHES = {
     }
 }
 
-# ─── Logging ──────────────────────────────────────────────────────
+# ─── Logging ─────────────────────────────────────────────────────────
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -254,5 +274,6 @@ LOGGING = {
         },
     },
 }
+
 AUTH_USER_MODEL = "campusos.User"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
