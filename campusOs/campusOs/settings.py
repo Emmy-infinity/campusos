@@ -19,7 +19,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # ─── Security ────────────────────────────────────────────────────────
 SECRET_KEY = os.getenv("SECRET_KEY", "django-insecure-fallback-key-change-me")
-DEBUG = os.getenv("DEBUG", "True") == "True"
+#DEBUG = os.getenv("DEBUG", "True") == "True"
+DEBUG =True
 
 # Specific hosts instead of wildcard — safer
 ALLOWED_HOSTS = [
