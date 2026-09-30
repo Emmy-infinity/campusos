@@ -24,10 +24,13 @@ DOCUMENT_ALLOWED_EXTENSIONS, DOCUMENT_MAX_UPLOAD_BYTES; throttle scopes
 "ai_calls" (30/min) and "ai_purchase" (10/hour) may be overridden in
 REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]. See ai_services.py for AI settings.
 
-Security notes carried over from the previous revision: ownership-filtered
-lookups (404), no internal error text to clients, server-side token pricing,
-purchase endpoint disabled outside simulation, document writes limited to
-uploader/admin.
+Security notes: ownership-filtered lookups (404), no internal error text to
+clients, server-side token pricing, purchase endpoint disabled outside
+simulation, document writes limited to uploader/admin.
+
+Text extraction: on Document create/update, `extract_text` reads the file
+(already stored on Cloudinary via RawMediaCloudinaryStorage) and populates
+`content_text`, which the post_save signal then indexes into `search_vector`.
 """
 import logging
 import os
@@ -40,8 +43,9 @@ from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
-from rest_framework import status, viewsets, permissions
+from rest_framework import status, viewsets, permissions, generics
 from rest_framework.exceptions import PermissionDenied, ValidationError as DRFValidationError
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
 from rest_framework.views import APIView
@@ -57,17 +61,22 @@ from .models import (
     AIServiceConfig, UserAICredit, PaymentTransaction, AIPurchasePackage,
 )
 from .serializers import (
-    DocumentSerializer, UserAICreditSerializer, AIServiceConfigSerializer,
+    DocumentSerializer,
+    UserAICreditSerializer,
+    AIServiceConfigSerializer,
+    UserSerializer,
+    RegisterSerializer,
 )
 from .tasks import (
     highlight_document_task, grade_exam_attempt_task, evaluate_research_task,
 )
+from .utils.text_extraction import extract_text
 
 logger = logging.getLogger(__name__)
 
 
 # -----------------------------------------------------------------------------
-# Throttles (work even if the scope has no configured rate)
+# Throttles
 # -----------------------------------------------------------------------------
 
 class AICallThrottle(UserRateThrottle):
@@ -133,7 +142,7 @@ def user_can_use_course(user, course):
 
 
 def enqueue(task, args, user):
-    """Queue `task` with an owner-prefixed id; return the id or None if the broker is down."""
+    """Queue `task` with an owner-prefixed id; return the id or None if broker is down."""
     task_id = new_task_id(user)
     try:
         task.apply_async(args=args, task_id=task_id)
@@ -144,38 +153,34 @@ def enqueue(task, args, user):
 
 
 def queue_unavailable():
-    return Response({"error": "The AI service is temporarily unavailable. Please try again shortly."},
-                    status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    return Response(
+        {"error": "The AI service is temporarily unavailable. Please try again shortly."},
+        status=status.HTTP_503_SERVICE_UNAVAILABLE,
+    )
 
 
 def accepted(task_id):
-    return Response({"task_id": task_id, "status": "queued"}, status=status.HTTP_202_ACCEPTED)
+    return Response(
+        {"task_id": task_id, "status": "queued"},
+        status=status.HTTP_202_ACCEPTED,
+    )
 
 
 # =============================================================================
-# Task status
+# Current user
 # =============================================================================
-
-
-
-
-
-
-from .serializers import UserSerializer
 
 class UserMeView(APIView):
+    """GET /api/users/me/ — returns the authenticated user's data."""
     permission_classes = [permissions.IsAuthenticated]
+
     def get(self, request):
         return Response(UserSerializer(request.user).data)
 
 
-
-
-
-from rest_framework import generics
-from rest_framework.permissions import AllowAny
-from .serializers import RegisterSerializer
-
+# =============================================================================
+# Registration (public)
+# =============================================================================
 
 class RegisterView(generics.CreateAPIView):
     """
@@ -202,10 +207,12 @@ class RegisterView(generics.CreateAPIView):
     """
     serializer_class = RegisterSerializer
     permission_classes = [AllowAny]
-    throttle_classes = []   # Add a throttle here if you want rate limiting
+    throttle_classes = []
 
 
-
+# =============================================================================
+# Task status
+# =============================================================================
 
 class AITaskStatusView(APIView):
     """GET /api/ai/tasks/<task_id>/ — owner (or admin) only."""
@@ -239,8 +246,10 @@ class AIHighlightView(APIView):
     def post(self, request):
         document_id = parse_positive_int(request.data.get("document_id"))
         if document_id is None:
-            return Response({"error": "document_id is required and must be a positive integer."},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "document_id is required and must be a positive integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         document = get_object_or_404(Document.objects.visible_to(request.user), pk=document_id)
 
@@ -250,8 +259,10 @@ class AIHighlightView(APIView):
             return Response({"error": str(exc)}, status=exc.status_code)
 
         if not can_afford(request.user, document.content_text, HIGHLIGHT_MAX_TOKENS):
-            return Response({"error": "Insufficient AI tokens. Please purchase more."},
-                            status=status.HTTP_402_PAYMENT_REQUIRED)
+            return Response(
+                {"error": "Insufficient AI tokens. Please purchase more."},
+                status=status.HTTP_402_PAYMENT_REQUIRED,
+            )
 
         task_id = enqueue(highlight_document_task, [document.id, request.user.id], request.user)
         return accepted(task_id) if task_id else queue_unavailable()
@@ -275,18 +286,24 @@ class ExamSubmitView(APIView):
     def post(self, request):
         attempt_id = parse_positive_int(request.data.get("attempt_id"))
         if attempt_id is None:
-            return Response({"error": "attempt_id is required and must be a positive integer."},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "attempt_id is required and must be a positive integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         attempts = ExamAttempt.objects.select_related("exam", "student__user")
         if not is_admin(request.user):
             attempts = attempts.filter(student__user=request.user)
 
         with transaction.atomic():
-            attempt = get_object_or_404(attempts.select_for_update(of=("self",)), pk=attempt_id)
+            attempt = get_object_or_404(
+                attempts.select_for_update(of=("self",)), pk=attempt_id
+            )
             if attempt.status != ExamAttempt.Status.IN_PROGRESS:
-                return Response({"error": "Attempt is already submitted or graded."},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"error": "Attempt is already submitted or graded."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
             now = timezone.now()
             attempt.status = ExamAttempt.Status.SUBMITTED
@@ -303,13 +320,13 @@ class ExamSubmitView(APIView):
         # Committed. Nothing for the AI to do -> finish inline.
         if not has_structured_answers(attempt, exam_marks):
             result = finalize_attempt(attempt.id)
-            return Response({"message": "Exam submitted and graded.", **result},
-                            status=status.HTTP_200_OK)
+            return Response(
+                {"message": "Exam submitted and graded.", **result},
+                status=status.HTTP_200_OK,
+            )
 
         task_id = enqueue(grade_exam_attempt_task, [attempt.id], request.user)
         if task_id is None:
-            # The attempt is safely SUBMITTED; grading can be re-queued later
-            # (the task is idempotent), so don't fail the student's submission.
             return Response(
                 {"message": "Exam submitted. Marking is delayed and will complete shortly.",
                  "attempt_id": attempt.id, "status": attempt.status},
@@ -334,10 +351,14 @@ class ResearchGuidanceView(APIView):
     def post(self, request):
         submission_id = parse_positive_int(request.data.get("submission_id"))
         if submission_id is None:
-            return Response({"error": "submission_id is required and must be a positive integer."},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "submission_id is required and must be a positive integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        submissions = ResearchSubmission.objects.select_related("student__user", "document", "rubric")
+        submissions = ResearchSubmission.objects.select_related(
+            "student__user", "document", "rubric"
+        )
         if not is_admin(request.user):
             submissions = submissions.filter(student__user=request.user)
         submission = get_object_or_404(submissions, pk=submission_id)
@@ -348,10 +369,15 @@ class ResearchGuidanceView(APIView):
             return Response({"error": str(exc)}, status=exc.status_code)
 
         # Billed to the submission's owner, so check *their* balance.
-        if not can_afford(submission.student.user, submission.document.content_text,
-                          RESEARCH_MAX_TOKENS):
-            return Response({"error": "Insufficient AI tokens."},
-                            status=status.HTTP_402_PAYMENT_REQUIRED)
+        if not can_afford(
+            submission.student.user,
+            submission.document.content_text,
+            RESEARCH_MAX_TOKENS,
+        ):
+            return Response(
+                {"error": "Insufficient AI tokens."},
+                status=status.HTTP_402_PAYMENT_REQUIRED,
+            )
 
         task_id = enqueue(evaluate_research_task, [submission.id], request.user)
         return accepted(task_id) if task_id else queue_unavailable()
@@ -383,8 +409,10 @@ class PurchaseTokensView(APIView):
 
     def post(self, request):
         if not getattr(settings, "AI_SIMULATE_PAYMENTS", settings.DEBUG):
-            return Response({"error": "Online payments are not available yet."},
-                            status=status.HTTP_501_NOT_IMPLEMENTED)
+            return Response(
+                {"error": "Online payments are not available yet."},
+                status=status.HTTP_501_NOT_IMPLEMENTED,
+            )
 
         config = AIServiceConfig.load()
         raw_package_id = request.data.get("package_id")
@@ -392,32 +420,44 @@ class PurchaseTokensView(APIView):
         if raw_package_id not in (None, ""):
             package_id = parse_positive_int(raw_package_id)
             if package_id is None:
-                return Response({"error": "package_id must be a positive integer."},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"error": "package_id must be a positive integer."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             package = get_object_or_404(AIPurchasePackage, pk=package_id, is_active=True)
             amount_cents, tokens = package.price_cents, package.tokens
         else:
             if not config.allow_pay_as_you_go:
-                return Response({"error": "Custom token purchases are currently disabled."},
-                                status=status.HTTP_403_FORBIDDEN)
+                return Response(
+                    {"error": "Custom token purchases are currently disabled."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
             amount_cents = parse_positive_int(request.data.get("amount_cents"))
             if amount_cents is None:
-                return Response({"error": "Provide package_id, or a positive integer amount_cents."},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"error": "Provide package_id, or a positive integer amount_cents."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             tokens = amount_cents // max(1, config.token_cost_cents)
             if tokens < 1:
-                return Response({"error": "Amount is too small to buy any tokens."},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"error": "Amount is too small to buy any tokens."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             claimed = request.data.get("tokens")
             if claimed not in (None, "") and parse_positive_int(claimed) != tokens:
-                return Response({"error": "tokens does not match the current price; "
-                                          "omit it and send amount_cents only."},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"error": "tokens does not match the current price; "
+                              "omit it and send amount_cents only."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             if (config.max_purchasable_tokens is not None
                     and tokens > config.max_purchasable_tokens):
-                return Response({"error": f"Cannot purchase more than "
-                                          f"{config.max_purchasable_tokens} tokens at once."},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"error": f"Cannot purchase more than "
+                              f"{config.max_purchasable_tokens} tokens at once."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         with transaction.atomic():
             payment = PaymentTransaction.objects.create(
@@ -431,7 +471,8 @@ class PurchaseTokensView(APIView):
 
         credit, _ = UserAICredit.objects.get_or_create(user=request.user)
         return Response(
-            {"message": "Payment successful (simulated).", "tokens_purchased": tokens,
+            {"message": "Payment successful (simulated).",
+             "tokens_purchased": tokens,
              "balance": UserAICreditSerializer(credit).data},
             status=status.HTTP_200_OK,
         )
@@ -453,7 +494,9 @@ class AIServiceConfigView(APIView):
         return Response(AIServiceConfigSerializer(AIServiceConfig.load()).data)
 
     def _update(self, request):
-        serializer = AIServiceConfigSerializer(AIServiceConfig.load(), data=request.data, partial=True)
+        serializer = AIServiceConfigSerializer(
+            AIServiceConfig.load(), data=request.data, partial=True
+        )
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
@@ -497,7 +540,9 @@ class DocumentViewSet(viewsets.ModelViewSet):
         max_bytes = getattr(settings, "DOCUMENT_MAX_UPLOAD_BYTES", 25 * 1024 * 1024)
         extension = os.path.splitext(upload.name)[1].lower()
         if extension not in allowed:
-            raise DRFValidationError({"file": [f"File type '{extension}' is not allowed."]})
+            raise DRFValidationError(
+                {"file": [f"File type '{extension}' is not allowed."]}
+            )
         if upload.size > max_bytes:
             raise DRFValidationError(
                 {"file": [f"File is too large (max {max_bytes // (1024 * 1024)} MB)."]}
@@ -506,11 +551,23 @@ class DocumentViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         self._validate_course(serializer)
         self._validate_file(serializer)
-        serializer.save(uploaded_by=self.request.user)
-        # TODO: queue a Celery task to extract text into content_text
-        # (the post_save signal then refreshes search_vector).
+
+        document = serializer.save(uploaded_by=self.request.user)
+
+        # Extract text right after the file lands on Cloudinary.
+        # The post_save signal on Document then refreshes search_vector.
+        document.content_text = extract_text(document.file)
+        document.save(update_fields=["content_text"])
 
     def perform_update(self, serializer):
         self._validate_course(serializer)
         self._validate_file(serializer)
-        serializer.save()
+
+        # Detect whether the file is being replaced.
+        replacing_file = "file" in serializer.validated_data
+
+        document = serializer.save()
+
+        if replacing_file:
+            document.content_text = extract_text(document.file)
+            document.save(update_fields=["content_text"])
