@@ -10,16 +10,15 @@ Conventions:
   input; they are always set from request.user.
 
 CHANGELOG (fixes applied):
-- DocumentSerializer: removed `search_vector` from read_only_fields (it
-  was not declared in Meta.fields, which DRF resolves against) and
-  removed the dead `validate()` — content_text is read-only, so the
-  check inside validate() could never fire.
+- DocumentSerializer: `course_id` is now `required=False` (matching the
+  model's `null=True, blank=True`) so documents can be uploaded without
+  a course. Also removed `search_vector` from read_only_fields (it was
+  not declared in Meta.fields) and removed the dead validate().
 - ExamSerializer: removed the redundant `source='exam_questions'` on the
   `exam_questions` field (name and source were identical).
 - HighlightSerializer: `create()` no longer relies on
   super().create() to accept a `user` kwarg — it pops the derived user
-  straight into the model constructor, which is both clearer and
-  version-agnostic.
+  straight into the model constructor.
 """
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
@@ -104,10 +103,6 @@ class EnrollmentSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'enrolled_at']
 
 
-
-
-
-
 # =============================================================================
 # Registration serializer
 # =============================================================================
@@ -178,11 +173,9 @@ class RegisterSerializer(serializers.Serializer):
 
     @transaction.atomic
     def create(self, validated_data):
-        # Pop profile-only fields before creating the User
         student_id = validated_data.pop('student_id', None)
         staff_id = validated_data.pop('staff_id', None)
         enrollment_year = validated_data.pop('enrollment_year', None)
-        # Note: `department` and `designation` will go on the profile, not User
         department = validated_data.pop('department', '')
         designation = validated_data.pop('designation', '')
 
@@ -190,13 +183,11 @@ class RegisterSerializer(serializers.Serializer):
         password = validated_data.pop('password')
         validated_data.pop('password_confirm')
 
-        # Create the base User
         user = User(**validated_data)
         user.role = role
-        user.set_password(password)   # hashes the password
+        user.set_password(password)
         user.save()
 
-        # Create the profile
         if role == 'STUDENT':
             StudentProfile.objects.create(
                 user=user,
@@ -212,26 +203,15 @@ class RegisterSerializer(serializers.Serializer):
                 designation=designation or '',
             )
 
-        # UserAICredit is created automatically by the post_save signal on User
-
         return user
 
     def to_representation(self, instance):
-        """After creation, return user data plus JWT tokens."""
         refresh = RefreshToken.for_user(instance)
         return {
             "user": UserSerializer(instance).data,
             "refresh": str(refresh),
             "access": str(refresh.access_token),
         }
-
-
-
-
-
-
-
-
 
 
 # =============================================================================
@@ -244,11 +224,18 @@ class DocumentSerializer(serializers.ModelSerializer):
     no writable `uploaded_by_id`. `content_text` is populated by a
     background extraction task and is read-only. `search_vector` is a
     Postgres tsvector and is intentionally NOT exposed.
+
+    `course_id` is optional (required=False) to match the model's
+    `null=True, blank=True`. Documents without a course are allowed.
     """
     uploaded_by = UserSerializer(read_only=True)
     course = CourseSerializer(read_only=True)
     course_id = serializers.PrimaryKeyRelatedField(
-        source='course', queryset=Course.objects.all(), write_only=True, allow_null=True
+        source='course',
+        queryset=Course.objects.all(),
+        write_only=True,
+        allow_null=True,
+        required=False,          # ← THE FIX: matches model null=True, blank=True
     )
 
     class Meta:
