@@ -277,6 +277,22 @@ LOGGING = {
 
 
 CORS_ALLOW_ALL = True
+# ─── Document Upload Settings ───────────────────────────────────────
+# Allow .odt and other document types your users upload
+DOCUMENT_ALLOWED_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".odt",
+    ".txt", ".md", ".ppt", ".pptx",
+    ".xls", ".xlsx", ".csv", ".rtf",
+}
+
+# Max file size for uploads (25 MB)
+DOCUMENT_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+# Django's upload limits — MUST be higher than your max file size
+DATA_UPLOAD_MAX_MEMORY_SIZE = 25 * 1024 * 1024      # 25 MB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 25 * 1024 * 1024      # 25 MB
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 1000
+DATA_UPLOAD_MAX_NUMBER_FILES = 100
 
 AUTH_USER_MODEL = "campusos.User"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
