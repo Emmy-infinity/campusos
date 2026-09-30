@@ -284,3 +284,31 @@ DATA_UPLOAD_MAX_NUMBER_FILES = 100
 
 AUTH_USER_MODEL = "campusos.User"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+
+# ─── Celery Configuration ────────────────────────────────────────────
+# On free tier: run tasks synchronously in-process (no broker needed).
+# When you pay for Redis + Worker, set CELERY_TASK_ALWAYS_EAGER=False
+# in Render's environment variables — no code changes required.
+
+CELERY_TASK_ALWAYS_EAGER = os.getenv("CELERY_TASK_ALWAYS_EAGER", "True") == "True"
+
+# These only apply when CELERY_TASK_ALWAYS_EAGER is False
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)
+
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_TRACK_STARTED = True
+
+# Production tuning (applies whether eager or async)
+CELERY_TASK_TIME_LIMIT = 180            # hard kill after 3 minutes
+CELERY_TASK_SOFT_TIME_LIMIT = 150       # graceful shutdown at 2.5 min
+CELERY_TASK_ACKS_LATE = True            # retry if worker dies mid-run
+CELERY_RESULT_EXPIRES = 3600            # keep results for 1 hour
+
+# Eager-mode specifics
+CELERY_TASK_EAGER_PROPAGATES = True     # raise exceptions synchronously in dev
+CELERY_TASK_STORE_EAGER_RESULT = True   # store results in-process for AsyncResult
