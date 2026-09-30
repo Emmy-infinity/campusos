@@ -1,8 +1,6 @@
 """
-Create a superuser for the campusOS project.
-
-WARNING: Has a default password for quick testing.
-Set DJANGO_SUPERUSER_PASSWORD as an env var in production.
+Create or reset the admin superuser for campusOS.
+Runs during Render's build. Safe to re-run — always syncs with env vars.
 """
 import os
 import django
@@ -14,22 +12,36 @@ from django.contrib.auth import get_user_model
 
 User = get_user_model()
 
-# Read credentials from environment variables with defaults
 username = os.environ.get('DJANGO_SUPERUSER_USERNAME', 'admin')
 email = os.environ.get('DJANGO_SUPERUSER_EMAIL', 'admin@example.com')
-password = os.environ.get('DJANGO_SUPERUSER_PASSWORD', 'Admin12345')  # ← default here
+password = os.environ.get('DJANGO_SUPERUSER_PASSWORD')
 
-if User.objects.filter(username=username).exists():
-    print(f"Superuser '{username}' already exists. Skipping creation.")
-else:
-    print(f"Creating superuser: {username}")
-    user = User.objects.create_superuser(
-        username=username,
-        email=email,
-        password=password,
-    )
-    user.role = User.Role.ADMIN
-    user.save(update_fields=['role'])
-    print(f"Superuser created: {username} (role={user.role})")
+print("=" * 50)
+print("Admin setup")
+print("=" * 50)
+print(f"Username env: {username}")
+print(f"Email env: {email}")
+print(f"Password env set: {'YES' if password else 'NO — using fallback'}")
 
-print(f"Total users: {User.objects.count()}")
+if not password:
+    password = 'Admin12345'
+    print("WARNING: DJANGO_SUPERUSER_PASSWORD not set. Using fallback: Admin12345")
+
+user, created = User.objects.get_or_create(
+    username=username,
+    defaults={'email': email},
+)
+
+user.email = email
+user.role = 'ADMIN'
+user.is_staff = True
+user.is_superuser = True
+user.is_active = True
+user.set_password(password)
+user.save()
+
+action = "CREATED" if created else "RESET"
+print(f"==> {action} superuser: {username}")
+print(f"==> Login with: {username} / {password}")
+print(f"==> Total users: {User.objects.count()}")
+print("=" * 50)
