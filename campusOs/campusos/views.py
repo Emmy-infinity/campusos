@@ -172,7 +172,37 @@ class UserMeView(APIView):
 
 
 
+from rest_framework import generics
+from rest_framework.permissions import AllowAny
+from .serializers import RegisterSerializer
 
+
+class RegisterView(generics.CreateAPIView):
+    """
+    POST /api/register/   (public — no auth required)
+
+    Body:
+        {
+            "username": "jdoe",
+            "email": "jdoe@example.com",
+            "password": "StrongPass123",
+            "password_confirm": "StrongPass123",
+            "first_name": "Jane",
+            "last_name": "Doe",
+            "role": "STUDENT",
+            "student_id": "2024-CS-001",
+            "department": "Computer Science",
+            "enrollment_year": 2024
+        }
+
+    Or for a lecturer:
+        "role": "LECTURER", "staff_id": "STF-102", "designation": "Senior Lecturer"
+
+    Returns the created user plus JWT tokens.
+    """
+    serializer_class = RegisterSerializer
+    permission_classes = [AllowAny]
+    throttle_classes = []   # Add a throttle here if you want rate limiting
 
 
 
