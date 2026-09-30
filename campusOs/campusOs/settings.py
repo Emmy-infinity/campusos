@@ -222,19 +222,19 @@ WHITENOISE_MAX_AGE = 31536000 if not DEBUG else 0
 # ─── Cloudinary ──────────────────────────────────────────────────────
 # ⚠️ SECURITY: No hardcoded fallbacks for secrets.
 # Set these as environment variables in Render.
+# ─── Cloudinary ────────────────────────────────────────────────────
 cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", "dtll1o9u0"),
+    api_key=os.getenv("CLOUDINARY_API_KEY", "387833656525477"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET", "YOUR_NEW_SECRET_HERE"),
     secure=True,
 )
 
 CLOUDINARY_STORAGE = {
-    "CLOUD_NAME": os.getenv("CLOUDINARY_CLOUD_NAME"),
-    "API_KEY": os.getenv("CLOUDINARY_API_KEY"),
-    "API_SECRET": os.getenv("CLOUDINARY_API_SECRET"),
+    "CLOUD_NAME": os.getenv("CLOUDINARY_CLOUD_NAME", "dtll1o9u0"),
+    "API_KEY": os.getenv("CLOUDINARY_API_KEY", "387833656525477"),
+    "API_SECRET": os.getenv("CLOUDINARY_API_SECRET", "YOUR_NEW_SECRET_HERE"),
 }
-
 # ─── Flutterwave ─────────────────────────────────────────────────────
 FLW_SECRET_KEY = os.getenv("FLUTTERWAVE_SECRET_KEY", "")
 FLW_SECRET_HASH = os.getenv("FLUTTERWAVE_WEBHOOK_SECRET_HASH", "")
