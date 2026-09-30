@@ -6,10 +6,13 @@ enqueue, and return 202 with a task_id.
 
 Async endpoints
 ---------------
-POST /api/ai/highlight/      -> 202 {"task_id"}   (or 402/403/404/400 up front)
+POST /api/ai/highlight/      -> 200 {"status":"completed","result":...}  (eager mode)
+                                202 {"task_id"}                        (async mode)
 POST /api/exam/submit/       -> 200 if fully graded inline (MCQ-only exam),
-                                202 {"task_id"} if AI marking was queued
-POST /api/research/guidance/ -> 202 {"task_id"}
+                                200 {"status":"completed"}             (eager mode)
+                                202 {"task_id"}                        (async mode)
+POST /api/research/guidance/ -> 200 {"status":"completed","result":...}  (eager mode)
+                                202 {"task_id"}                        (async mode)
 GET  /api/ai/tasks/<task_id>/ -> {"state": "PENDING|STARTED|SUCCESS|FAILURE",
                                   "ok": bool, "data"/"error": ...}
 
@@ -18,6 +21,11 @@ while marking runs and GRADED when finished. Research progress is visible via
 ResearchSubmission.evaluation_status (PENDING -> EVALUATED).
 
 Do NOT enable ATOMIC_REQUESTS: tasks must see committed rows.
+
+Celery mode:
+  - CELERY_TASK_ALWAYS_EAGER=True (default)  -> tasks run in-process (free tier)
+  - CELERY_TASK_ALWAYS_EAGER=False           -> tasks run in a worker (paid tier)
+  No code changes required to switch between modes — flip the env var.
 
 Optional settings: AI_SIMULATE_PAYMENTS (defaults to DEBUG),
 DOCUMENT_ALLOWED_EXTENSIONS, DOCUMENT_MAX_UPLOAD_BYTES; throttle scopes
@@ -117,6 +125,11 @@ def is_admin(user):
     return user.is_authenticated and (user.is_superuser or user.role == User.Role.ADMIN)
 
 
+def eager_mode():
+    """True when Celery runs tasks in-process (no broker/worker needed)."""
+    return getattr(settings, "CELERY_TASK_ALWAYS_EAGER", True)
+
+
 class IsAppAdmin(permissions.BasePermission):
     """Matches this app's definition of admin (is_superuser OR role == ADMIN)."""
     def has_permission(self, request, view):
@@ -141,15 +154,32 @@ def user_can_use_course(user, course):
     return Enrollment.objects.filter(student=profile, course=course).exists()
 
 
-def enqueue(task, args, user):
-    """Queue `task` with an owner-prefixed id; return the id or None if broker is down."""
+def dispatch(task, args, user):
+    """
+    Run or enqueue a Celery task depending on CELERY_TASK_ALWAYS_EAGER.
+
+    Returns:
+        ("sync", result)        — task ran inline, `result` is the return value
+        ("async", task_id)      — task queued, `task_id` is for polling
+        ("error", exception)    — sync run raised, or enqueue failed
+    """
     task_id = new_task_id(user)
+
+    if eager_mode():
+        try:
+            result = task.apply(args=args, task_id=task_id).get(disable_sync_subtasks=False)
+            return "sync", result
+        except Exception as exc:
+            logger.exception("Eager task %s failed", getattr(task, "name", task))
+            return "error", exc
+
+    # Async mode
     try:
-        task.apply_async(args=args, task_id=task_id)
-    except Exception:
-        logger.exception("Could not enqueue %s", task.name)
-        return None
-    return task_id
+        ar = task.apply_async(args=args, task_id=task_id)
+        return "async", ar.id
+    except Exception as exc:
+        logger.exception("Could not enqueue %s", getattr(task, "name", task))
+        return "error", exc
 
 
 def queue_unavailable():
@@ -163,6 +193,16 @@ def accepted(task_id):
     return Response(
         {"task_id": task_id, "status": "queued"},
         status=status.HTTP_202_ACCEPTED,
+    )
+
+
+def ai_failed(exc):
+    """Map an AI exception to a client-facing response."""
+    if isinstance(exc, AIRequestError):
+        return Response({"error": str(exc)}, status=exc.status_code)
+    return Response(
+        {"error": "AI processing failed. Please try again."},
+        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
     )
 
 
@@ -215,7 +255,12 @@ class RegisterView(generics.CreateAPIView):
 # =============================================================================
 
 class AITaskStatusView(APIView):
-    """GET /api/ai/tasks/<task_id>/ — owner (or admin) only."""
+    """
+    GET /api/ai/tasks/<task_id>/ — owner (or admin) only.
+
+    Useful in async mode. In eager mode the result is already returned by the
+    POST endpoint, so polling isn't needed.
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, task_id):
@@ -230,7 +275,6 @@ class AITaskStatusView(APIView):
         if state == "FAILURE":
             return Response({"state": state, "ok": False,
                              "error": "AI processing failed. Please try again later."})
-        # PENDING (queued or unknown id), STARTED, RETRY
         return Response({"state": state})
 
 
@@ -251,7 +295,9 @@ class AIHighlightView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        document = get_object_or_404(Document.objects.visible_to(request.user), pk=document_id)
+        document = get_object_or_404(
+            Document.objects.visible_to(request.user), pk=document_id
+        )
 
         try:
             check_highlight_ready(document)
@@ -264,8 +310,20 @@ class AIHighlightView(APIView):
                 status=status.HTTP_402_PAYMENT_REQUIRED,
             )
 
-        task_id = enqueue(highlight_document_task, [document.id, request.user.id], request.user)
-        return accepted(task_id) if task_id else queue_unavailable()
+        mode, payload = dispatch(
+            highlight_document_task,
+            [document.id, request.user.id],
+            request.user,
+        )
+
+        if mode == "sync":
+            return Response(
+                {"status": "completed", "result": payload},
+                status=status.HTTP_200_OK,
+            )
+        if mode == "async":
+            return accepted(payload)
+        return queue_unavailable()
 
 
 # =============================================================================
@@ -277,8 +335,9 @@ class ExamSubmitView(APIView):
     POST /api/exam/submit/  Body: {"attempt_id": 1}
 
     Claims the attempt (row-locked) and grades MCQs synchronously; both are
-    fast and deterministic. Structured answers are marked by AI in a worker.
-    AI marking is billed to the student who owns the attempt.
+    fast and deterministic. Structured answers are marked by AI (inline in
+    eager mode; in a worker otherwise). AI marking is billed to the student
+    who owns the attempt.
     """
     permission_classes = [permissions.IsAuthenticated]
     throttle_classes = [AICallThrottle]
@@ -317,7 +376,7 @@ class ExamSubmitView(APIView):
             exam_marks = get_exam_question_marks(attempt.exam)
             grade_mcq_answers(attempt, exam_marks)
 
-        # Committed. Nothing for the AI to do -> finish inline.
+        # Nothing for the AI to do -> finish inline.
         if not has_structured_answers(attempt, exam_marks):
             result = finalize_attempt(attempt.id)
             return Response(
@@ -325,16 +384,32 @@ class ExamSubmitView(APIView):
                 status=status.HTTP_200_OK,
             )
 
-        task_id = enqueue(grade_exam_attempt_task, [attempt.id], request.user)
-        if task_id is None:
+        mode, payload = dispatch(
+            grade_exam_attempt_task, [attempt.id], request.user
+        )
+
+        if mode == "sync":
+            attempt.refresh_from_db()
             return Response(
-                {"message": "Exam submitted. Marking is delayed and will complete shortly.",
-                 "attempt_id": attempt.id, "status": attempt.status},
+                {
+                    "message": "Exam submitted and graded.",
+                    "attempt_id": attempt.id,
+                    "status": attempt.status,
+                    "score": str(attempt.score) if attempt.score is not None else None,
+                },
+                status=status.HTTP_200_OK,
+            )
+        if mode == "async":
+            return Response(
+                {"message": "Exam submitted. Marking is in progress.",
+                 "attempt_id": attempt.id, "status": attempt.status, "task_id": payload},
                 status=status.HTTP_202_ACCEPTED,
             )
+
+        # Enqueue failed — attempt is safely SUBMITTED, marking can be retried.
         return Response(
-            {"message": "Exam submitted. Marking is in progress.",
-             "attempt_id": attempt.id, "status": attempt.status, "task_id": task_id},
+            {"message": "Exam submitted. Marking is delayed and will complete shortly.",
+             "attempt_id": attempt.id, "status": attempt.status},
             status=status.HTTP_202_ACCEPTED,
         )
 
@@ -379,8 +454,28 @@ class ResearchGuidanceView(APIView):
                 status=status.HTTP_402_PAYMENT_REQUIRED,
             )
 
-        task_id = enqueue(evaluate_research_task, [submission.id], request.user)
-        return accepted(task_id) if task_id else queue_unavailable()
+        mode, payload = dispatch(
+            evaluate_research_task, [submission.id], request.user
+        )
+
+        if mode == "sync":
+            submission.refresh_from_db()
+            return Response(
+                {
+                    "status": "completed",
+                    "submission_id": submission.id,
+                    "evaluation_status": submission.evaluation_status,
+                    "overall_score": (
+                        str(submission.overall_score)
+                        if submission.overall_score is not None
+                        else None
+                    ),
+                },
+                status=status.HTTP_200_OK,
+            )
+        if mode == "async":
+            return accepted(payload)
+        return queue_unavailable()
 
 
 # =============================================================================
