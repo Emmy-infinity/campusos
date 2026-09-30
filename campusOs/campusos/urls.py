@@ -11,6 +11,7 @@ router.register(r'documents', views.DocumentViewSet, basename='document')
 urlpatterns = [
     # DRF viewsets
     path('', include(router.urls)),
+     path('register/', views.RegisterView.as_view(), name='register'),
 
     # JWT auth
     path('token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
