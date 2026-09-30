@@ -104,6 +104,136 @@ class EnrollmentSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'enrolled_at']
 
 
+
+
+
+
+# =============================================================================
+# Registration serializer
+# =============================================================================
+
+from django.db import transaction
+from rest_framework_simplejwt.tokens import RefreshToken
+
+
+class RegisterSerializer(serializers.Serializer):
+    """
+    Public registration serializer.
+
+    Creates a User plus the matching profile (StudentProfile or LecturerProfile)
+    atomically. Role must be STUDENT or LECTURER — ADMIN accounts are created
+    only via createsuperuser or the create_superuser.py script.
+
+    Returns JWT tokens so the caller is immediately logged in.
+    """
+    # Account fields
+    username = serializers.CharField(max_length=150)
+    email = serializers.EmailField()
+    password = serializers.CharField(write_only=True, min_length=8)
+    password_confirm = serializers.CharField(write_only=True, min_length=8)
+    first_name = serializers.CharField(max_length=150, required=False, allow_blank=True)
+    last_name = serializers.CharField(max_length=150, required=False, allow_blank=True)
+    role = serializers.ChoiceField(choices=['STUDENT', 'LECTURER'])
+
+    # Student-only fields
+    student_id = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    department = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    enrollment_year = serializers.IntegerField(required=False, allow_null=True)
+
+    # Lecturer-only fields
+    staff_id = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    designation = serializers.CharField(max_length=100, required=False, allow_blank=True)
+
+    def validate_username(self, value):
+        if User.objects.filter(username__iexact=value).exists():
+            raise serializers.ValidationError("This username is already taken.")
+        return value
+
+    def validate_email(self, value):
+        if User.objects.filter(email__iexact=value).exists():
+            raise serializers.ValidationError("This email is already registered.")
+        return value
+
+    def validate(self, attrs):
+        # Password match
+        if attrs['password'] != attrs['password_confirm']:
+            raise serializers.ValidationError({"password_confirm": "Passwords do not match."})
+
+        role = attrs.get('role')
+
+        # Role-specific required fields
+        if role == 'STUDENT':
+            if not attrs.get('student_id'):
+                raise serializers.ValidationError({"student_id": "student_id is required for students."})
+            if StudentProfile.objects.filter(student_id=attrs['student_id']).exists():
+                raise serializers.ValidationError({"student_id": "This student ID is already registered."})
+
+        if role == 'LECTURER':
+            if not attrs.get('staff_id'):
+                raise serializers.ValidationError({"staff_id": "staff_id is required for lecturers."})
+            if LecturerProfile.objects.filter(staff_id=attrs['staff_id']).exists():
+                raise serializers.ValidationError({"staff_id": "This staff ID is already registered."})
+
+        return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        # Pop profile-only fields before creating the User
+        student_id = validated_data.pop('student_id', None)
+        staff_id = validated_data.pop('staff_id', None)
+        enrollment_year = validated_data.pop('enrollment_year', None)
+        # Note: `department` and `designation` will go on the profile, not User
+        department = validated_data.pop('department', '')
+        designation = validated_data.pop('designation', '')
+
+        role = validated_data.pop('role')
+        password = validated_data.pop('password')
+        validated_data.pop('password_confirm')
+
+        # Create the base User
+        user = User(**validated_data)
+        user.role = role
+        user.set_password(password)   # hashes the password
+        user.save()
+
+        # Create the profile
+        if role == 'STUDENT':
+            StudentProfile.objects.create(
+                user=user,
+                student_id=student_id,
+                department=department or '',
+                enrollment_year=enrollment_year,
+            )
+        elif role == 'LECTURER':
+            LecturerProfile.objects.create(
+                user=user,
+                staff_id=staff_id,
+                department=department or '',
+                designation=designation or '',
+            )
+
+        # UserAICredit is created automatically by the post_save signal on User
+
+        return user
+
+    def to_representation(self, instance):
+        """After creation, return user data plus JWT tokens."""
+        refresh = RefreshToken.for_user(instance)
+        return {
+            "user": UserSerializer(instance).data,
+            "refresh": str(refresh),
+            "access": str(refresh.access_token),
+        }
+
+
+
+
+
+
+
+
+
+
 # =============================================================================
 # Document & Highlight serializers
 # =============================================================================
