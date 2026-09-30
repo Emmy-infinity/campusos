@@ -1,23 +1,35 @@
+"""
+Create a superuser for the campusOS project.
+
+WARNING: Has a default password for quick testing.
+Set DJANGO_SUPERUSER_PASSWORD as an env var in production.
+"""
 import os
 import django
 
-# 1. Point to your Django settings module
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'campusOs.settings') # Replace 'myproject' with your folder name
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'campusOs.settings')
 django.setup()
 
 from django.contrib.auth import get_user_model
 
 User = get_user_model()
 
-# 2. Get credentials from environment variables
+# Read credentials from environment variables with defaults
 username = os.environ.get('DJANGO_SUPERUSER_USERNAME', 'admin')
 email = os.environ.get('DJANGO_SUPERUSER_EMAIL', 'admin@example.com')
-password = os.environ.get('DJANGO_SUPERUSER_PASSWORD', 'SecretPassword123')
+password = os.environ.get('DJANGO_SUPERUSER_PASSWORD', 'Admin12345')  # ← default here
 
-# 3. Create user if they do not exist
-if not User.objects.filter(username=username).exists():
-    print(f"Creating superuser: {username}")
-    User.objects.create_superuser(username=username, email=email, password=password)
-    print("Superuser created successfully!")
+if User.objects.filter(username=username).exists():
+    print(f"Superuser '{username}' already exists. Skipping creation.")
 else:
-    print(f"Superuser '{username}' already exists. Skipping.")
+    print(f"Creating superuser: {username}")
+    user = User.objects.create_superuser(
+        username=username,
+        email=email,
+        password=password,
+    )
+    user.role = User.Role.ADMIN
+    user.save(update_fields=['role'])
+    print(f"Superuser created: {username} (role={user.role})")
+
+print(f"Total users: {User.objects.count()}")
