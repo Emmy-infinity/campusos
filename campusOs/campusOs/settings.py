@@ -312,3 +312,16 @@ CELERY_RESULT_EXPIRES = 3600            # keep results for 1 hour
 # Eager-mode specifics
 CELERY_TASK_EAGER_PROPAGATES = True     # raise exceptions synchronously in dev
 CELERY_TASK_STORE_EAGER_RESULT = True   # store results in-process for AsyncResult
+
+# ─── OpenRouter (AI) ────────────────────────────────────────────────
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "https://campusos-0ju0.onrender.com")
+OPENROUTER_APP_TITLE = os.getenv("OPENROUTER_APP_TITLE", "CampusOS")
+OPENROUTER_JSON_MODE = True
+OPENROUTER_TIMEOUT = 60
+
+# Model used by ai_services.py
+# "deepseek/deepseek-v4-flash" is what works on your OpenRouter account
+AI_DEFAULT_MODEL = os.getenv("AI_DEFAULT_MODEL", "deepseek/deepseek-v4-flash")
+AI_GRADING_MODEL = os.getenv("AI_GRADING_MODEL", "deepseek/deepseek-v4-flash")
+AI_MAX_INPUT_CHARS = int(os.getenv("AI_MAX_INPUT_CHARS", "30000"))
