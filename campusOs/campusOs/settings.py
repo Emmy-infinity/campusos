@@ -19,39 +19,33 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # ─── Security ────────────────────────────────────────────────────────
 SECRET_KEY = os.getenv("SECRET_KEY", "django-insecure-fallback-key-change-me")
-#DEBUG = os.getenv("DEBUG", "True") == "True"
-DEBUG =True
+DEBUG = os.getenv("DEBUG", "True") == "True"
 
-# Specific hosts instead of wildcard — safer
 ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
     "campusos-0ju0.onrender.com",
-    ".onrender.com",          # allows any *.onrender.com host
+    ".onrender.com",
 ]
 
 # ─── CORS & CSRF ─────────────────────────────────────────────────────
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://olailongfrontend.onrender.com")
 
 CORS_ALLOWED_ORIGINS = [
-    # Local development
     "http://localhost:3000",
     "http://localhost:5173",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
-    # Deployed frontends
     "https://olailongfrontend.onrender.com",
     "https://olailongmarket-pwa.onrender.com",
     "https://campusos-0ju0.onrender.com",
     FRONTEND_URL,
 ]
 
-# Allow any *.onrender.com subdomain (covers future deploys)
 CORS_ALLOWED_ORIGIN_REGEXES = [
     r"^https://.*\.onrender\.com$",
 ]
 
-# For quick debugging only — set CORS_ALLOW_ALL=True in Render env to enable
 if os.getenv("CORS_ALLOW_ALL", "False") == "True":
     CORS_ALLOW_ALL_ORIGINS = True
 
@@ -219,22 +213,20 @@ WHITENOISE_USE_FINDERS = True
 WHITENOISE_AUTOREFRESH = DEBUG
 WHITENOISE_MAX_AGE = 31536000 if not DEBUG else 0
 
-# ─── Cloudinary ──────────────────────────────────────────────────────
-# ⚠️ SECURITY: No hardcoded fallbacks for secrets.
-# Set these as environment variables in Render.
-# ─── Cloudinary ────────────────────────────────────────────────────
+# ─── Cloudinary (HARDCODED — see warning below) ──────────────────────
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", "dtll1o9u0"),
     api_key=os.getenv("CLOUDINARY_API_KEY", "387833656525477"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET", "YOUR_NEW_SECRET_HERE"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET", "AmTSvrVHKiLlN2ArzFgctGx_-70"),
     secure=True,
 )
 
 CLOUDINARY_STORAGE = {
     "CLOUD_NAME": os.getenv("CLOUDINARY_CLOUD_NAME", "dtll1o9u0"),
     "API_KEY": os.getenv("CLOUDINARY_API_KEY", "387833656525477"),
-    "API_SECRET": os.getenv("CLOUDINARY_API_SECRET", "YOUR_NEW_SECRET_HERE"),
+    "API_SECRET": os.getenv("CLOUDINARY_API_SECRET", "AmTSvrVHKiLlN2ArzFgctGx_-70"),
 }
+
 # ─── Flutterwave ─────────────────────────────────────────────────────
 FLW_SECRET_KEY = os.getenv("FLUTTERWAVE_SECRET_KEY", "")
 FLW_SECRET_HASH = os.getenv("FLUTTERWAVE_WEBHOOK_SECRET_HASH", "")
@@ -276,22 +268,17 @@ LOGGING = {
     },
 }
 
-
-CORS_ALLOW_ALL = True
 # ─── Document Upload Settings ───────────────────────────────────────
-# Allow .odt and other document types your users upload
 DOCUMENT_ALLOWED_EXTENSIONS = {
     ".pdf", ".doc", ".docx", ".odt",
     ".txt", ".md", ".ppt", ".pptx",
     ".xls", ".xlsx", ".csv", ".rtf",
 }
 
-# Max file size for uploads (25 MB)
 DOCUMENT_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
-# Django's upload limits — MUST be higher than your max file size
-DATA_UPLOAD_MAX_MEMORY_SIZE = 25 * 1024 * 1024      # 25 MB
-FILE_UPLOAD_MAX_MEMORY_SIZE = 25 * 1024 * 1024      # 25 MB
+DATA_UPLOAD_MAX_MEMORY_SIZE = 25 * 1024 * 1024
+FILE_UPLOAD_MAX_MEMORY_SIZE = 25 * 1024 * 1024
 DATA_UPLOAD_MAX_NUMBER_FIELDS = 1000
 DATA_UPLOAD_MAX_NUMBER_FILES = 100
 
