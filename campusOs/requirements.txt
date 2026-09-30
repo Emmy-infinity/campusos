@@ -21,6 +21,10 @@ celery
 # Add any that are missing from your requirements.txt:
 openai
 
+pypdf
+python-docx
+odfpy
+
 requests
 celery
 redis
