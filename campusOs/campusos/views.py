@@ -16,10 +16,6 @@ POST /api/research/guidance/ -> 200 {"status":"completed","result":...}  (eager 
 GET  /api/ai/tasks/<task_id>/ -> {"state": "PENDING|STARTED|SUCCESS|FAILURE",
                                   "ok": bool, "data"/"error": ...}
 
-Exam progress can also be read from the attempt itself: status is SUBMITTED
-while marking runs and GRADED when finished. Research progress is visible via
-ResearchSubmission.evaluation_status (PENDING -> EVALUATED).
-
 Do NOT enable ATOMIC_REQUESTS: tasks must see committed rows.
 
 Celery mode:
@@ -27,18 +23,9 @@ Celery mode:
   - CELERY_TASK_ALWAYS_EAGER=False           -> tasks run in a worker (paid tier)
   No code changes required to switch between modes — flip the env var.
 
-Optional settings: AI_SIMULATE_PAYMENTS (defaults to DEBUG),
-DOCUMENT_ALLOWED_EXTENSIONS, DOCUMENT_MAX_UPLOAD_BYTES; throttle scopes
-"ai_calls" (30/min) and "ai_purchase" (10/hour) may be overridden in
-REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]. See ai_services.py for AI settings.
-
-Security notes: ownership-filtered lookups (404), no internal error text to
-clients, server-side token pricing, purchase endpoint disabled outside
-simulation, document writes limited to uploader/admin.
-
-Text extraction: on Document create/update, `extract_text` reads the file
-(already stored on Cloudinary via RawMediaCloudinaryStorage) and populates
-`content_text`, which the post_save signal then indexes into `search_vector`.
+Debug mode: when DEBUG=True, AI task errors are surfaced in the HTTP response
+so the real cause is visible without Render Shell access. When DEBUG=False,
+the generic 503 message is returned to protect internal details.
 """
 import logging
 import os
@@ -130,6 +117,11 @@ def eager_mode():
     return getattr(settings, "CELERY_TASK_ALWAYS_EAGER", True)
 
 
+def debug_mode():
+    """True when DEBUG is on — surface raw task errors to the client."""
+    return bool(getattr(settings, "DEBUG", False))
+
+
 class IsAppAdmin(permissions.BasePermission):
     """Matches this app's definition of admin (is_superuser OR role == ADMIN)."""
     def has_permission(self, request, view):
@@ -170,7 +162,12 @@ def dispatch(task, args, user):
             result = task.apply(args=args, task_id=task_id).get(disable_sync_subtasks=False)
             return "sync", result
         except Exception as exc:
-            logger.exception("Eager task %s failed", getattr(task, "name", task))
+            logger.exception(
+                "Eager task %s FAILED | args=%r | error=%s",
+                getattr(task, "name", task),
+                args,
+                exc,
+            )
             return "error", exc
 
     # Async mode
@@ -178,11 +175,28 @@ def dispatch(task, args, user):
         ar = task.apply_async(args=args, task_id=task_id)
         return "async", ar.id
     except Exception as exc:
-        logger.exception("Could not enqueue %s", getattr(task, "name", task))
+        logger.exception(
+            "Enqueue %s FAILED | args=%r | error=%s",
+            getattr(task, "name", task),
+            args,
+            exc,
+        )
         return "error", exc
 
 
-def queue_unavailable():
+def task_error_response(exc):
+    """
+    Build the response for a task failure.
+
+    In DEBUG: return the real exception message so we can debug without
+    Render Shell access.
+    In production: return a generic 503 so internal errors aren't leaked.
+    """
+    if debug_mode():
+        return Response(
+            {"error": f"AI task failed: {type(exc).__name__}: {exc}"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
     return Response(
         {"error": "The AI service is temporarily unavailable. Please try again shortly."},
         status=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -323,7 +337,8 @@ class AIHighlightView(APIView):
             )
         if mode == "async":
             return accepted(payload)
-        return queue_unavailable()
+        # ← CHANGED: expose the real error instead of the generic 503
+        return task_error_response(payload)
 
 
 # =============================================================================
@@ -406,12 +421,12 @@ class ExamSubmitView(APIView):
                 status=status.HTTP_202_ACCEPTED,
             )
 
-        # Enqueue failed — attempt is safely SUBMITTED, marking can be retried.
-        return Response(
-            {"message": "Exam submitted. Marking is delayed and will complete shortly.",
-             "attempt_id": attempt.id, "status": attempt.status},
-            status=status.HTTP_202_ACCEPTED,
-        )
+        # ← CHANGED: surface the error (in DEBUG) so we know what failed
+        resp = task_error_response(payload)
+        resp.data["attempt_id"] = attempt.id
+        resp.data["status"] = attempt.status
+        resp.data["message"] = "Exam submitted but AI marking failed."
+        return resp
 
 
 # =============================================================================
@@ -475,7 +490,8 @@ class ResearchGuidanceView(APIView):
             )
         if mode == "async":
             return accepted(payload)
-        return queue_unavailable()
+        # ← CHANGED: expose the real error instead of the generic 503
+        return task_error_response(payload)
 
 
 # =============================================================================
