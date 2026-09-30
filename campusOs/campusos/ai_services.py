@@ -43,7 +43,11 @@ logger = logging.getLogger(__name__)
 
 TWO_PLACES = Decimal("0.01")
 
-DEFAULT_MODEL = getattr(settings, "AI_DEFAULT_MODEL", "openai/gpt-3.5-turbo")
+#DEFAULT_MODEL = getattr(settings, "AI_DEFAULT_MODEL", "openai/gpt-3.5-turbo")
+#GRADING_MODEL = getattr(settings, "AI_GRADING_MODEL", DEFAULT_MODEL)
+
+
+DEFAULT_MODEL = getattr(settings, "AI_DEFAULT_MODEL", "deepseek/deepseek-v4-flash")
 GRADING_MODEL = getattr(settings, "AI_GRADING_MODEL", DEFAULT_MODEL)
 
 AI_MAX_INPUT_CHARS = getattr(settings, "AI_MAX_INPUT_CHARS", 30000)
