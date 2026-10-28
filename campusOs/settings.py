@@ -259,18 +259,16 @@ STORAGES = {
         "BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage",
     },
     "staticfiles": {
-        "BACKEND": (
-            "django.contrib.staticfiles.storage.StaticFilesStorage"
-            if DEBUG
-            else "whitenoise.storage.CompressedStaticFilesStorage" 
-        ),
+        # FIX: Switched to standard storage. Whitenoise's compression
+        # engine crashes on duplicate files (e.g., unfold vs admin).
+        # This prevents the FileNotFoundError during collectstatic.
+        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
     },
 }
 
 # ─── CRITICAL FIX FOR DJANGO 5.1 + CLOUDINARY_STORAGE ────────────────
 # The cloudinary_storage package still looks for this deprecated setting.
-# We map it to Whitenoise so the collectstatic command doesn't crash.
-STATICFILES_STORAGE = "whitenoise.storage.CompressedStaticFilesStorage"
+STATICFILES_STORAGE = "django.contrib.staticfiles.storage.StaticFilesStorage"
 
 # Set USE_FINDERS to True so Whitenoise looks inside apps (like unfold and DRF)
 WHITENOISE_USE_FINDERS = True
