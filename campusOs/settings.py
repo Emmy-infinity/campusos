@@ -4,11 +4,6 @@ Django settings for the campusOs project.
 All deployment-specific values and secrets come from environment variables
 (loaded from .env by python-decouple in local dev, from the platform's env
 store in production). Nothing sensitive is committed.
-
-Redis layout (one server, separate logical databases):
-    db 0  Celery broker      db 1  Celery results      db 2  Django cache
-The cache backs DRF throttling, the grading lock, the in-flight dedupe keys and
-the AI result cache, so it must be a shared Redis (not per-process locmem).
 """
 import os
 from datetime import timedelta
@@ -171,7 +166,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "rest_framework",
     "django_filters",
-    "campusos.apps.CampusosConfig",    # ← was "campusos"
+    "campusos.apps.CampusosConfig",
 ]
 
 # ─── Middleware ──────────────────────────────────────────────────────
@@ -208,15 +203,17 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "campusOs.wsgi.application"
 
-# ─── Database (env-driven, Render-compatible) ────────────────────────
+# ─── Database (Bulletproof for Neon/Render) ──────────────────────────
+# Fetch the exact string from the environment first, then explicitly 
+# parse it. This bypasses dj_database_url's fallback bugs.
+DATABASE_URL = config(
+    "DATABASE_URL", 
+    default="postgres://postgres:postgres@localhost:5432/campusos"
+)
+
 DATABASES = {
-    "default": dj_database_url.config(
-        default=config(
-            "DATABASE_URL",
-            # Fallback for local dev only. In production, DATABASE_URL
-            # is set by the platform (Render, Railway, etc.).
-            default="postgres://postgres:postgres@localhost:5432/campusos",
-        ),
+    "default": dj_database_url.parse(
+        DATABASE_URL,
         conn_max_age=60,
         conn_health_checks=True,
     )
@@ -354,17 +351,14 @@ AI_REASONING = {"enabled": False}
 AI_EXTRA_BODY = {}
 
 # ── Tunables: admin can override each one in AIServiceConfig ─────────
-# These are the env defaults the resolver falls back to when the
-# corresponding DB field is NULL.
 AI_HIGHLIGHT_MAX_TOKENS = config("AI_HIGHLIGHT_MAX_TOKENS", default=1500, cast=int)
 AI_GRADING_MAX_TOKENS = config("AI_GRADING_MAX_TOKENS", default=1000, cast=int)
 AI_RESEARCH_MAX_TOKENS = config("AI_RESEARCH_MAX_TOKENS", default=2000, cast=int)
-AI_REPAIR_ATTEMPTS = config("AI_REPAIR_ATTEMPTS", default=1, cast=int)   # ← moved from infra, now env-driven
-AI_TEMPERATURE = config("AI_TEMPERATURE", default=0.0, cast=float)       # ← added
+AI_REPAIR_ATTEMPTS = config("AI_REPAIR_ATTEMPTS", default=1, cast=int)
+AI_TEMPERATURE = config("AI_TEMPERATURE", default=0.0, cast=float)
 AI_MAX_ANSWER_CHARS = config("AI_MAX_ANSWER_CHARS", default=10000, cast=int)
 
 # ── Hard limits: env only, not exposed to admin ──────────────────────
-# These affect worker memory and cannot safely be changed from the UI.
 AI_MAX_INPUT_CHARS = config("AI_MAX_INPUT_CHARS", default=30000, cast=int)
 AI_MAX_TOKENS_CAP = config("AI_MAX_TOKENS_CAP", default=4000, cast=int)
 AI_CACHE_TTL = config("AI_CACHE_TTL", default=7 * 24 * 3600, cast=int)
