@@ -9,32 +9,23 @@ Conventions:
 - Fields attributed to "the current user" are NEVER writable from client
   input; they are always set from request.user.
 
-CHANGELOG (fixes applied):
-- CourseSerializer.lecturer_id: added required=False. Previously the field
-  was required=True even though allow_null=True, which caused
-  "lecturer_id: This field is required" on POST /api/courses/ from a
-  lecturer — the validation ran before perform_create() could auto-assign
-  the lecturer. Now the field is optional; if omitted, the view assigns it.
-- RubricSerializer.course_id: now REQUIRED with a validator that ensures
-  lecturers can only attach rubrics to courses they own. Prevents
-  course-less rubrics, which bypassed the enrolment check and created
-  orphan submissions invisible to every lecturer.
-- ResearchSubmissionCreateSerializer.rubric_id: now REQUIRED, and the
-  rubric must be tied to a course. The submission's `course` field is
-  derived from the rubric (not the document) so it is always non-null.
-  This closes the "orphan submission" class of bugs permanently.
-- DocumentSerializer: now exposes `content_pages` (read-only). Required by
-  the correction-report frontend which needs page-anchored citations.
-- ExamSerializer.get_total_marks: handles the case where the annotation
-  returns None (exam with zero questions) by falling back to the property.
-- ExamAttemptForLecturerSerializer: now uses ExamForLecturerPreviewSerializer
-  instead of ExamSerializer. Previously the nested `exam_questions[*].question`
-  was sent as a raw PK, which broke the /exams/attempt/{id}/ preview page
-  for lecturers (`undefined mark(s)` and no question text). The new
-  serializer nests the full question object (with answer key) so the page
-  renders identically to the student view.
-- (All prior changelog entries retained.)
+CHANGELOG (fixes applied in this revision):
+- AIServiceConfigSerializer: now exposes all nullable override fields
+  (highlight_model, grading_model, research_model, *_max_tokens,
+  repair_attempts, temperature) and `updated_by_username`. DecimalFields
+  declared explicitly so JSON output uses string-based Decimals (safe
+  for sub-cent prices).
+- ResearchSubmissionSerializer: added `has_ai_error` so the frontend can
+  distinguish the auto-eval failure payload ({"__error__": true, ...})
+  from a real evaluation payload without inspecting raw JSON.
+- SubmissionRosterSerializer: same `has_ai_error` field, for the
+  lecturer roster view.
+- UserAIUsageSerializer: explicit DecimalField for `cost_cents`
+  (model field is now numeric(10,6); the default auto-coercion would
+  have produced inconsistent JSON types across endpoints).
 """
+from decimal import Decimal
+
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.db import transaction
@@ -361,8 +352,6 @@ class ExamSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_by', 'created_at', 'updated_at']
 
     def get_total_marks(self, obj):
-        # Prefer the annotated value when it's a real number; fall back to the
-        # property for exams with zero questions (annotation yields None).
         annotated = getattr(obj, 'total_marks_annotated', None)
         if annotated is not None:
             return annotated
@@ -413,21 +402,13 @@ class AnswerSerializer(serializers.ModelSerializer):
 # =============================================================================
 
 class RubricSerializer(serializers.ModelSerializer):
-    """
-    A rubric is always tied to a course. This avoids the class of bugs where
-    a course-less rubric bypasses the enrolment check and produces an orphan
-    submission that no lecturer can find.
-
-    Lecturers may only attach rubrics to courses they teach; admins may
-    attach to any course.
-    """
     created_by = UserSerializer(read_only=True)
     course = CourseSerializer(read_only=True)
     course_id = serializers.PrimaryKeyRelatedField(
         source='course',
         queryset=Course.objects.all(),
         write_only=True,
-        required=True,        # ← was allow_null=True, now required
+        required=True,
         allow_null=False,
     )
 
@@ -438,10 +419,6 @@ class RubricSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_by', 'created_at', 'updated_at']
 
     def validate_course_id(self, course):
-        """
-        Admins may attach rubrics to any course.
-        Lecturers may only attach rubrics to courses they own.
-        """
         request = self.context.get('request')
         if request is None:
             return course
@@ -464,6 +441,8 @@ class ResearchSubmissionSerializer(serializers.ModelSerializer):
     document = DocumentSerializer(read_only=True)
     rubric = RubricSerializer(read_only=True)
     approved_by = UserSerializer(read_only=True)
+    # ── NEW: distinguishes __error__ sentinel from real evaluation ──
+    has_ai_error = serializers.SerializerMethodField()
 
     class Meta:
         model = ResearchSubmission
@@ -472,8 +451,16 @@ class ResearchSubmissionSerializer(serializers.ModelSerializer):
             'submitted_at', 'evaluation_status', 'ai_feedback',
             'overall_score', 'lecturer_comments',
             'approved_by', 'approved_at',
+            'has_ai_error',
         ]
         read_only_fields = fields
+
+    def get_has_ai_error(self, obj):
+        """True if ai_feedback is an error payload, False otherwise."""
+        return bool(
+            isinstance(obj.ai_feedback, dict)
+            and obj.ai_feedback.get("__error__")
+        )
 
 
 class RubricEvaluationSerializer(serializers.ModelSerializer):
@@ -498,22 +485,13 @@ class RubricEvaluationSerializer(serializers.ModelSerializer):
 # =============================================================================
 
 class ResearchSubmissionCreateSerializer(serializers.ModelSerializer):
-    """
-    A research submission is always attached to a rubric, and that rubric is
-    always tied to a course. The submission's `course` field is derived from
-    the rubric (never from the document) so it is guaranteed to be non-null.
-
-    This permanently eliminates the "orphan submission" class of bugs:
-    every submission is findable by the rubric's author, and every
-    submission rolls up into course analytics.
-    """
     document_id = serializers.PrimaryKeyRelatedField(
         source='document', queryset=Document.objects.all()
     )
     rubric_id = serializers.PrimaryKeyRelatedField(
         source='rubric',
         queryset=Rubric.objects.all(),
-        required=True,          # ← was required=False
+        required=True,
         allow_null=False,
     )
 
@@ -578,10 +556,10 @@ class ResearchSubmissionCreateSerializer(serializers.ModelSerializer):
                 "Only students with a student profile can submit research."
             )
 
-        rubric = validated_data['rubric']      # already validated: non-null, has course
+        rubric = validated_data['rubric']
         return ResearchSubmission.objects.create(
             student=profile,
-            course=rubric.course,              # derived from rubric, guaranteed non-null
+            course=rubric.course,
             **validated_data,
         )
 
@@ -595,6 +573,9 @@ class SubmissionRosterSerializer(serializers.ModelSerializer):
     )
     status_color = serializers.SerializerMethodField()
     approved_by_name = serializers.SerializerMethodField()
+    # ── NEW: same discriminator as the detail serializer ──
+    has_ai_error = serializers.SerializerMethodField()
+    ai_error_message = serializers.SerializerMethodField()
 
     class Meta:
         model = ResearchSubmission
@@ -603,6 +584,7 @@ class SubmissionRosterSerializer(serializers.ModelSerializer):
             'course_code', 'evaluation_status', 'status_color',
             'overall_score', 'submitted_at',
             'approved_by_name', 'approved_at',
+            'has_ai_error', 'ai_error_message',
         ]
 
     def get_student_name(self, obj):
@@ -622,6 +604,19 @@ class SubmissionRosterSerializer(serializers.ModelSerializer):
             return None
         u = obj.approved_by
         return (u.get_full_name() or u.username).strip()
+
+    def get_has_ai_error(self, obj):
+        return bool(
+            isinstance(obj.ai_feedback, dict)
+            and obj.ai_feedback.get("__error__")
+        )
+
+    def get_ai_error_message(self, obj):
+        if not isinstance(obj.ai_feedback, dict):
+            return None
+        if not obj.ai_feedback.get("__error__"):
+            return None
+        return obj.ai_feedback.get("message")
 
 
 class ResearchSubmissionApproveSerializer(serializers.Serializer):
@@ -644,10 +639,6 @@ class ResearchSubmissionApproveSerializer(serializers.Serializer):
 # =============================================================================
 
 class AnswerUpsertSerializer(serializers.ModelSerializer):
-    """
-    Save (create or update) a single answer inside an IN_PROGRESS attempt.
-    The attempt is provided by the view via serializer.context['attempt'].
-    """
     question_id = serializers.PrimaryKeyRelatedField(
         source='question', queryset=Question.objects.all()
     )
@@ -682,7 +673,7 @@ class AnswerUpsertSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {"selected_option": "Required and must be a valid option index."}
                 )
-        else:  # STRUCTURED
+        else:
             if attrs.get('selected_option') is not None:
                 raise serializers.ValidationError(
                     {"selected_option": "Structured questions only accept answer_text."}
@@ -693,20 +684,12 @@ class AnswerUpsertSerializer(serializers.ModelSerializer):
 # ── Student-facing serializers (hide the answer key) ─────────────────
 
 class QuestionForStudentSerializer(serializers.ModelSerializer):
-    """
-    Question view for a student actively taking an exam.
-    Excludes correct_option, model_answer, explanation, and rubric.
-    """
     class Meta:
         model = Question
         fields = ['id', 'question_type', 'text', 'options', 'marks']
 
 
 class ExamQuestionForStudentSerializer(serializers.ModelSerializer):
-    """
-    Exam-question link for students: nests the full (safe) question plus
-    the effective marks (override or question default) for display.
-    """
     question = QuestionForStudentSerializer(read_only=True)
     effective_marks = serializers.SerializerMethodField()
 
@@ -719,10 +702,6 @@ class ExamQuestionForStudentSerializer(serializers.ModelSerializer):
 
 
 class ExamForStudentSerializer(serializers.ModelSerializer):
-    """
-    Exam metadata plus stripped questions for the student taking it.
-    No is_published/created_by leakage; students only see what they need.
-    """
     course = CourseSerializer(read_only=True)
     exam_questions = ExamQuestionForStudentSerializer(many=True, read_only=True)
     total_marks = serializers.SerializerMethodField()
@@ -745,11 +724,6 @@ class ExamForStudentSerializer(serializers.ModelSerializer):
 # ── Lecturer preview serializers (same shape, includes answer key) ───
 
 class ExamQuestionForLecturerSerializer(serializers.ModelSerializer):
-    """
-    Lecturer preview: nests the FULL question (with correct_option,
-    model_answer, explanation) so a lecturer opening /exams/attempt/{id}/
-    sees the same layout as a student, plus the answer key for verification.
-    """
     question = QuestionSerializer(read_only=True)
     effective_marks = serializers.SerializerMethodField()
 
@@ -762,11 +736,6 @@ class ExamQuestionForLecturerSerializer(serializers.ModelSerializer):
 
 
 class ExamForLecturerPreviewSerializer(serializers.ModelSerializer):
-    """
-    Same top-level shape as ExamForStudentSerializer, but with the nested
-    questions carrying the full answer key. Used when a lecturer previews
-    an attempt at /exams/attempt/{id}/.
-    """
     course = CourseSerializer(read_only=True)
     exam_questions = ExamQuestionForLecturerSerializer(many=True, read_only=True)
     total_marks = serializers.SerializerMethodField()
@@ -789,11 +758,6 @@ class ExamForLecturerPreviewSerializer(serializers.ModelSerializer):
 # ── Attempt detail serializers ────────────────────────────────────────
 
 class AnswerDetailSerializer(serializers.ModelSerializer):
-    """
-    Student-facing answer view. Uses the stripped question serializer
-    so the answer key (correct_option) never reaches the client during
-    or after the exam.
-    """
     question = QuestionForStudentSerializer(read_only=True)
 
     class Meta:
@@ -806,9 +770,7 @@ class AnswerDetailSerializer(serializers.ModelSerializer):
 
 
 class AnswerForStudentSerializer(serializers.ModelSerializer):
-    """
-    Alias kept for clarity — same shape as AnswerDetailSerializer.
-    """
+    """Alias kept for clarity — same shape as AnswerDetailSerializer."""
     question = QuestionForStudentSerializer(read_only=True)
 
     class Meta:
@@ -821,10 +783,6 @@ class AnswerForStudentSerializer(serializers.ModelSerializer):
 
 
 class ExamAttemptDetailSerializer(serializers.ModelSerializer):
-    """
-    Student-facing attempt view: exam questions are stripped of the
-    answer key. Use this for GET /api/attempts/{id}/ for students.
-    """
     exam = ExamForStudentSerializer(read_only=True)
     student = StudentProfileSerializer(read_only=True)
     answers = AnswerDetailSerializer(many=True, read_only=True)
@@ -840,13 +798,6 @@ class ExamAttemptDetailSerializer(serializers.ModelSerializer):
 
 
 class ExamAttemptForLecturerSerializer(serializers.ModelSerializer):
-    """
-    Lecturer/admin view of an attempt. Uses ExamForLecturerPreviewSerializer
-    so the questions render the same way in the UI as they do for students
-    (nested objects with text/marks/question_type), plus the answer key
-    for verification. Previously this used ExamSerializer, which nests
-    questions as bare PKs and broke the /exams/attempt/{id}/ preview.
-    """
     exam = ExamForLecturerPreviewSerializer(read_only=True)
     student = StudentProfileSerializer(read_only=True)
     answers = AnswerSerializer(many=True, read_only=True)
@@ -862,7 +813,6 @@ class ExamAttemptForLecturerSerializer(serializers.ModelSerializer):
 
 
 class ExamAttemptStartSerializer(serializers.Serializer):
-    """Body for POST /api/attempts/start/."""
     exam_id = serializers.IntegerField()
 
 
@@ -871,15 +821,57 @@ class ExamAttemptStartSerializer(serializers.Serializer):
 # =============================================================================
 
 class AIServiceConfigSerializer(serializers.ModelSerializer):
+    """
+    Admin-tunable AI settings.
+
+    Every override field (models, *_max_tokens, repair_attempts, temperature)
+    is nullable — NULL means "inherit from .env". Explicit DecimalFields keep
+    the JSON encoding consistent across endpoints (sub-cent prices encode as
+    strings, not truncated floats).
+    """
+    token_cost_cents = serializers.DecimalField(
+        max_digits=10, decimal_places=6, required=False,
+    )
+    temperature = serializers.DecimalField(
+        max_digits=3, decimal_places=2, required=False, allow_null=True,
+    )
+    updated_by_username = serializers.SerializerMethodField()
+
     class Meta:
         model = AIServiceConfig
         fields = [
-            'ai_highlighting_enabled', 'ai_marking_enabled',
-            'ai_research_guidance_enabled', 'token_cost_cents',
-            'free_tokens_per_month', 'allow_pay_as_you_go',
-            'max_purchasable_tokens', 'updated_at',
+            # Feature gates
+            'ai_highlighting_enabled',
+            'ai_marking_enabled',
+            'ai_research_guidance_enabled',
+            # Pricing
+            'token_cost_cents',
+            # Allowance
+            'free_tokens_per_month',
+            'allow_pay_as_you_go',
+            'max_purchasable_tokens',
+            # Per-feature models (nullable)
+            'highlight_model',
+            'grading_model',
+            'research_model',
+            # Per-feature token budgets (nullable)
+            'highlight_max_tokens',
+            'grading_max_tokens',
+            'research_max_tokens',
+            # Reliability / sampling (nullable)
+            'repair_attempts',
+            'temperature',
+            # Audit
+            'updated_at',
+            'updated_by_username',
         ]
         read_only_fields = ['updated_at']
+
+    def get_updated_by_username(self, obj):
+        if not obj.updated_by_id:
+            return None
+        u = obj.updated_by
+        return (u.get_full_name() or u.username).strip()
 
 
 class UserAICreditSerializer(serializers.ModelSerializer):
@@ -897,6 +889,10 @@ class UserAIUsageSerializer(serializers.ModelSerializer):
     user = UserSerializer(read_only=True)
     related_document = DocumentSerializer(read_only=True)
     related_answer = AnswerSerializer(read_only=True)
+    # Explicit DecimalField — the model field is numeric(10,6) now.
+    cost_cents = serializers.DecimalField(
+        max_digits=10, decimal_places=6, read_only=True,
+    )
 
     class Meta:
         model = UserAIUsage
@@ -913,10 +909,11 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
         fields = ['id', 'user', 'amount_cents', 'tokens_purchased', 'status',
                   'transaction_id', 'created_at', 'completed_at']
         read_only_fields = ['id', 'user', 'status', 'created_at', 'completed_at']
+
+
 class PaymentTransactionStatusSerializer(serializers.ModelSerializer):
     """
     Minimal shape the frontend polls after returning from Pesapal.
-    Exposes only what the /tokens page needs to render success/failure.
     """
     reference = serializers.CharField(source="transaction_id", read_only=True)
 

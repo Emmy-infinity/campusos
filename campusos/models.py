@@ -13,54 +13,60 @@ RubricEvaluation records over time.
 
 AI features (highlighting, marking, research guidance) are metered:
 - AIServiceConfig (singleton) holds admin-configurable cost/limit settings.
+  Every override field is nullable: NULL = "inherit from .env", value =
+  "admin has overridden". The resolve_*() helpers in ai_services.py
+  implement DB → env → hardcoded fallback.
 - UserAICredit stores each user's token balance (auto-created per user).
+  The balance may go negative after an exam-grading overage; try_consume()
+  blocks new AI calls until it's topped up.
 - UserAIUsage logs every token-consuming AI call, with a trace back to what
-  was processed.
+  was processed. cost_cents is a DecimalField so fractional per-token prices
+  don't truncate to zero.
 - PaymentTransaction records purchases of AI tokens and is the source of
   truth that feeds UserAICredit via signal.
 - AIPurchasePackage provides predefined token bundles for the frontend.
 
-CHANGELOG (fixes applied):
-- UserAICredit.refund_tokens() added: a proper refund that ONLY touches
-  remaining_tokens. The AI views previously reused add_tokens() for refunds,
-  which also increments total_purchased_tokens — permanently corrupting
-  each user's lifetime purchase statistics on every failed AI call.
-- Exam.total_marks / ExamQuerySet.with_total_marks() now use explicit F()
-  expressions inside Coalesce() instead of bare strings, which is the
-  canonical form and avoids FieldError on stricter Django versions.
+CHANGELOG
+---------
+- AIServiceConfig: made per-feature model, max_tokens, repair_attempts,
+  and temperature nullable so .env is the default and admin override is
+  optional. Added updated_by for audit. token_cost_cents switched from
+  PositiveIntegerField to DecimalField so fractional cent-per-token prices
+  are expressible. delete() now raises NotImplementedError instead of
+  returning None silently.
+- UserAICredit: removed MinValueValidator(0) from remaining_tokens so exam
+  grading overage can push the balance negative (a valid "user owes"
+  state). Added charge_anyway() for that path. Added grant_allowance()
+  so monthly top-ups don't share a method name with failed-call refunds.
+  reset_monthly_allowances() is now a single SQL UPDATE instead of a
+  Python loop over every user.
+- UserAIUsage.cost_cents: changed from PositiveIntegerField to
+  DecimalField to match token_cost_cents. Existing integer values
+  convert cleanly (X → X.000000).
+- UserAICredit.refund_tokens() (kept from prior revision): a proper refund
+  that ONLY touches remaining_tokens. The AI views previously reused
+  add_tokens() for refunds, which also increments total_purchased_tokens —
+  permanently corrupting each user's lifetime purchase statistics on every
+  failed AI call.
+- Exam.total_marks / ExamQuerySet.with_total_marks() use explicit F()
+  expressions inside Coalesce() instead of bare strings.
 - Document.file: max_length=500 added — the default 100 chars was too short
-  for Cloudinary-style paths and crashed uploads with DataError on Postgres.
+  for Cloudinary-style paths.
 - ResearchSubmission: added approved_by / approved_at so lecturer approvals
-  are audit-trailed (who approved, when), and the roster view can filter on
-  an "approved" state without touching lecturer_comments heuristics.
+  are audit-trailed.
 - ExamAttempt: added last_activity_at, timed_out, abandoned_at so a strict
-  exam session can be enforced server-side. Every save-answer / heartbeat
-  bumps last_activity_at; the deadline is computed as
-  min(start_time + duration, exam.end_time). A student who never returns
-  gets timed_out=True when the deadline passes and Celery Beat sweeps
-  stale IN_PROGRESS attempts; a student who closes the tab can call
-  /abandon/ which stamps abandoned_at. Either way the attempt is finalized
-  and the lecturer sees it flagged in analytics.
+  exam session can be enforced server-side.
 - Document: added content_pages (JSON list of {page, text}) so the correction
-  report can cite exact page numbers ("Page 2, Paragraph 1") instead of
-  referring to flat character offsets in content_text.
+  report can cite exact page numbers.
 - CorrectionReport: new model. One row per generated branded correction PDF.
-  Attached to a ResearchSubmission and (optionally) the specific
-  RubricEvaluation it was generated from, so historical PDFs survive later
-  re-evaluations. Status tracks PENDING → GENERATING → READY/FAILED so the
-  frontend can poll.
 - StudentProfile / LecturerProfile: added `avatar` (ImageField, nullable,
-  blank). Stored on Cloudinary via MediaCloudinaryStorage. Existing rows and
-  users created without a picture are unaffected (NULL). The UserSerializer
-  exposes avatar_url so the frontend can render it everywhere the user is
-  shown (nav, submissions roster, exam analytics, etc.).
-- Removed duplicate cloudinary_storage import that appeared twice in the
-  module. No behaviour change, just cleanup.
-  
+  blank).
 """
 
 
 import logging
+from decimal import Decimal
+
 from django.conf import settings
 from django.contrib.auth.models import AbstractUser
 from django.contrib.postgres.indexes import GinIndex
@@ -74,6 +80,7 @@ from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.utils import timezone
 from cloudinary_storage.storage import RawMediaCloudinaryStorage, MediaCloudinaryStorage
+
 logger = logging.getLogger(__name__)
 
 
@@ -746,18 +753,92 @@ class CorrectionReport(models.Model):
 # =============================================================================
 
 class AIServiceConfig(models.Model):
+    """
+    Singleton row (pk=1) holding admin-tunable AI settings.
+
+    Every "override" field is nullable. NULL means "inherit from .env";
+    any non-NULL value means "admin has overridden the env default". The
+    ai_services.resolve_*() helpers implement the fallback chain:
+        DB value (if not NULL) → env value → hardcoded default.
+
+    Fields with no env fallback (feature toggles, token_cost_cents,
+    free_tokens_per_month, allow_pay_as_you_go, max_purchasable_tokens)
+    are pure admin settings — they always come from this row.
+    """
+
+    # ─── Feature gates (no env fallback) ────────────────────────────
     ai_highlighting_enabled = models.BooleanField(default=True)
     ai_marking_enabled = models.BooleanField(default=True)
     ai_research_guidance_enabled = models.BooleanField(default=True)
 
-    token_cost_cents = models.PositiveIntegerField(
-        default=1,
-        validators=[MinValueValidator(1)],
+    # ─── Pricing (no env fallback) ──────────────────────────────────
+    token_cost_cents = models.DecimalField(
+        max_digits=10, decimal_places=6, default=Decimal("0.001000"),
+        validators=[MinValueValidator(0)],
+        help_text=(
+            "Cents per token. 0.001 = 0.00001 UGX per token. "
+            "Realistic for deepseek/deepseek-v4-flash."
+        ),
     )
+
+    # ─── Free allowance (no env fallback) ───────────────────────────
     free_tokens_per_month = models.PositiveIntegerField(default=1000)
     allow_pay_as_you_go = models.BooleanField(default=True)
     max_purchasable_tokens = models.PositiveIntegerField(null=True, blank=True)
+
+    # ─── Per-feature models (NULL = inherit from env) ───────────────
+    highlight_model = models.CharField(
+        max_length=200, null=True, blank=True,
+        help_text="NULL = inherit from AI_DEFAULT_MODEL. "
+                  "Override example: 'openai/gpt-4o-mini'.",
+    )
+    grading_model = models.CharField(
+        max_length=200, null=True, blank=True,
+        help_text="NULL = inherit from AI_GRADING_MODEL.",
+    )
+    research_model = models.CharField(
+        max_length=200, null=True, blank=True,
+        help_text="NULL = inherit from AI_DEFAULT_MODEL.",
+    )
+
+    # ─── Per-feature token budgets (NULL = inherit from env) ────────
+    highlight_max_tokens = models.PositiveIntegerField(
+        null=True, blank=True,
+        validators=[MinValueValidator(100), MaxValueValidator(8000)],
+        help_text="NULL = inherit from AI_HIGHLIGHT_MAX_TOKENS.",
+    )
+    grading_max_tokens = models.PositiveIntegerField(
+        null=True, blank=True,
+        validators=[MinValueValidator(100), MaxValueValidator(8000)],
+        help_text="NULL = inherit from AI_GRADING_MAX_TOKENS.",
+    )
+    research_max_tokens = models.PositiveIntegerField(
+        null=True, blank=True,
+        validators=[MinValueValidator(100), MaxValueValidator(8000)],
+        help_text="NULL = inherit from AI_RESEARCH_MAX_TOKENS.",
+    )
+
+    # ─── Reliability / sampling (NULL = inherit from env) ───────────
+    repair_attempts = models.PositiveSmallIntegerField(
+        null=True, blank=True,
+        validators=[MaxValueValidator(3)],
+        help_text="NULL = inherit from AI_REPAIR_ATTEMPTS.",
+    )
+    temperature = models.DecimalField(
+        max_digits=3, decimal_places=2, null=True, blank=True,
+        validators=[MinValueValidator(0), MaxValueValidator(2)],
+        help_text="NULL = inherit from AI_TEMPERATURE (or 0.0 if unset).",
+    )
+
+    # ─── Audit ──────────────────────────────────────────────────────
     updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Who last changed these settings.",
+    )
 
     class Meta:
         verbose_name = "AI Service Configuration"
@@ -767,11 +848,13 @@ class AIServiceConfig(models.Model):
         return "AI Service Configuration"
 
     def save(self, *args, **kwargs):
-        self.pk = 1
+        self.pk = 1   # singleton
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
-        pass
+        raise NotImplementedError(
+            "AIServiceConfig is a singleton. Use .load() to access it."
+        )
 
     @classmethod
     def load(cls):
@@ -787,36 +870,46 @@ class UserAICredit(models.Model):
     )
     remaining_tokens = models.IntegerField(
         default=0,
-        validators=[MinValueValidator(0)],
+        # No MinValueValidator — overage from exam grading can make this
+        # negative. That means "user owes N tokens"; try_consume() blocks
+        # future AI calls until the balance is topped up. Negative-balance
+        # entries are only ever written by charge_anyway().
     )
     total_purchased_tokens = models.PositiveIntegerField(default=0)
     last_reset_at = models.DateTimeField(default=timezone.now)
-
-    class Meta:
-        pass
-
-    def clean(self):
-        super().clean()
-        if self.remaining_tokens < 0:
-            raise ValidationError({'remaining_tokens': 'Cannot be negative.'})
-
-    def save(self, *args, **kwargs):
-        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"Credit for {self.user}"
 
     def try_consume(self, amount):
+        """
+        Atomic 'charge if sufficient balance'. Returns True if the charge
+        succeeded, False if the balance was too low.
+        """
         if amount <= 0:
             raise ValueError("amount must be positive")
         updated = UserAICredit.objects.filter(
-            pk=self.pk, remaining_tokens__gte=amount
+            pk=self.pk, remaining_tokens__gte=amount,
         ).update(remaining_tokens=F('remaining_tokens') - amount)
         if updated:
             self.refresh_from_db(fields=['remaining_tokens'])
         return bool(updated)
 
+    def charge_anyway(self, amount):
+        """
+        Charge even if the balance goes negative. Used by settle_tokens()
+        for overage on an already-submitted exam answer — we can't un-grade,
+        so we debit and let the balance go negative.
+        """
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        UserAICredit.objects.filter(pk=self.pk).update(
+            remaining_tokens=F('remaining_tokens') - amount,
+        )
+        self.refresh_from_db(fields=['remaining_tokens'])
+
     def add_tokens(self, amount):
+        """Purchase: adds to balance AND lifetime purchased total."""
         if amount <= 0:
             raise ValueError("amount must be positive")
         UserAICredit.objects.filter(pk=self.pk).update(
@@ -826,6 +919,7 @@ class UserAICredit(models.Model):
         self.refresh_from_db(fields=['remaining_tokens', 'total_purchased_tokens'])
 
     def refund_tokens(self, amount):
+        """Reverse a failed AI reservation. Does NOT touch purchase total."""
         if amount <= 0:
             raise ValueError("amount must be positive")
         UserAICredit.objects.filter(pk=self.pk).update(
@@ -833,21 +927,31 @@ class UserAICredit(models.Model):
         )
         self.refresh_from_db(fields=['remaining_tokens'])
 
+    def grant_allowance(self, amount):
+        """Monthly free-token grant. Tracked separately from refunds."""
+        if amount <= 0:
+            return
+        UserAICredit.objects.filter(pk=self.pk).update(
+            remaining_tokens=F('remaining_tokens') + amount,
+        )
+        self.refresh_from_db(fields=['remaining_tokens'])
+
     @classmethod
     def reset_monthly_allowances(cls):
-        """Celery-beat task entry point: top up under-quota users to the free allowance."""
+        """
+        Celery-beat task entry point: top up every user below the free
+        allowance to the allowance. Single SQL UPDATE — no Python loop.
+        """
         config = AIServiceConfig.load()
         allowance = config.free_tokens_per_month
         if not allowance:
             return 0
-        updated = 0
-        for credit in cls.objects.filter(remaining_tokens__lt=allowance):
-            delta = allowance - credit.remaining_tokens
-            credit.refund_tokens(delta)
-            credit.last_reset_at = timezone.now()
-            credit.save(update_fields=['last_reset_at'])
-            updated += 1
-        return updated
+        return cls.objects.filter(
+            remaining_tokens__lt=allowance,
+        ).update(
+            remaining_tokens=allowance,
+            last_reset_at=timezone.now(),
+        )
 
 
 class UserAIUsage(models.Model):
@@ -858,7 +962,11 @@ class UserAIUsage(models.Model):
     )
     feature = models.CharField(max_length=50, db_index=True)
     tokens_used = models.PositiveIntegerField()
-    cost_cents = models.PositiveIntegerField()
+    # DecimalField so fractional token_cost_cents values don't truncate to
+    # zero. Existing integer values convert cleanly (X → X.000000).
+    cost_cents = models.DecimalField(
+        max_digits=10, decimal_places=6, default=Decimal("0"),
+    )
     related_document = models.ForeignKey(
         Document, on_delete=models.SET_NULL, null=True, blank=True, related_name='ai_usages',
     )
@@ -1012,6 +1120,7 @@ class PaymentTransaction(models.Model):
     def is_pesapal_order(self) -> bool:
         """True if this payment was submitted to Pesapal (vs simulated)."""
         return bool(self.pesapal_tracking_id or self.pesapal_merchant_reference)
+
 
 class AIPurchasePackage(models.Model):
     name = models.CharField(max_length=100)

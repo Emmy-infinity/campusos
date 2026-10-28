@@ -10,6 +10,7 @@ import logging
 import os
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 
 from celery import states
@@ -35,7 +36,7 @@ from .ai_services import (
     finalize_attempt, get_exam_question_marks, grade_mcq_answers,
     has_structured_answers, late_note, new_task_id, reset_config_cache,
     expire_attempt,
-    HIGHLIGHT_MAX_TOKENS, RESEARCH_MAX_TOKENS,
+    resolve_max_tokens,
 )
 from .auto_evaluate import kick_off_evaluation
 from .models import (
@@ -255,15 +256,6 @@ def accepted(task_id):
 
 
 # ─── Exam submission — two-phase, deadlock-free ─────────────────────
-#
-# Phase 1 (prepare): runs inside the caller's transaction, holds the
-#   attempt lock, marks SUBMITTED, grades MCQs synchronously.
-#   Returns either a terminal Response (no AI needed) or a small dict
-#   of state needed for phase 2.
-#
-# Phase 2 (grade): runs OUTSIDE the transaction, after the lock has
-#   been released. Dispatches the AI grading task. This is what
-#   prevents deadlocks with concurrent save-answer calls.
 
 def _perform_exam_submit_prepare(attempt):
     """
@@ -444,7 +436,9 @@ class AIHighlightView(APIView):
         except AIRequestError as exc:
             return Response({"error": str(exc)}, status=exc.status_code)
 
-        if not can_afford(request.user, document.content_text, HIGHLIGHT_MAX_TOKENS):
+        if not can_afford(
+            request.user, document.content_text, resolve_max_tokens("highlight")
+        ):
             return Response(
                 {"error": "Insufficient AI tokens. Please purchase more."},
                 status=status.HTTP_402_PAYMENT_REQUIRED,
@@ -489,18 +483,15 @@ class ExamSubmitView(APIView):
         if not is_admin(request.user):
             attempts = attempts.filter(student__user=request.user)
 
-        # Phase 1: mark SUBMITTED + grade MCQs, then release the lock.
         with transaction.atomic():
             attempt = get_object_or_404(
                 attempts.select_for_update(of=("self",)), pk=attempt_id
             )
             prepare_result = _perform_exam_submit_prepare(attempt)
 
-        # If we already have a terminal response, return it.
         if isinstance(prepare_result, Response):
             return prepare_result
 
-        # Phase 2: dispatch AI grading outside the transaction.
         return _perform_exam_submit_grade(request, prepare_result)
 
 
@@ -535,7 +526,7 @@ class ResearchGuidanceView(APIView):
         if not can_afford(
             submission.student.user,
             submission.document.content_text,
-            RESEARCH_MAX_TOKENS,
+            resolve_max_tokens("research_guidance"),
         ):
             return Response(
                 {"error": "Insufficient AI tokens."},
@@ -581,10 +572,6 @@ class TokenBalanceView(APIView):
 
 
 class AIPurchasePackageListView(generics.ListAPIView):
-    """
-    GET /api/ai/packages/
-    Read-only list of active token bundles for the /tokens page.
-    """
     serializer_class = AIPurchasePackageSerializer
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = None
@@ -594,16 +581,6 @@ class AIPurchasePackageListView(generics.ListAPIView):
 
 
 class PurchaseTokensView(APIView):
-    """
-    POST /api/ai/purchase/   { package_id }   OR   { amount_cents }
-
-    Response 200:
-        { payment_url, transaction_id, reference }
-
-    The frontend redirects the browser to `payment_url`. When the student
-    pays, Pesapal redirects them back to the callback URL and separately
-    fires the IPN webhook (PesapalIPNView), which credits the tokens.
-    """
     permission_classes = [permissions.IsAuthenticated]
     throttle_classes = [PurchaseThrottle]
 
@@ -650,7 +627,22 @@ class PurchaseTokensView(APIView):
                               "amount_cents."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            tokens = amount_cents // max(1, config.token_cost_cents)
+
+            # ── FIXED: Decimal-safe token calculation ──────────
+            token_cost = config.token_cost_cents or Decimal("0")
+            if token_cost <= 0:
+                logger.error(
+                    "PurchaseTokensView: token_cost_cents=%s is not positive; "
+                    "refusing to sell tokens at that price.",
+                    config.token_cost_cents,
+                )
+                return Response(
+                    {"error": "Token pricing is not configured. "
+                              "Please contact an administrator."},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            tokens = int(Decimal(amount_cents) / token_cost)
+
             if tokens < 1:
                 return Response(
                     {"error": "Amount is too small to buy any tokens."},
@@ -676,7 +668,9 @@ class PurchaseTokensView(APIView):
 
         # ── Create the PENDING transaction row ─────────────────
         reference = f"campusos-{uuid.uuid4().hex[:20]}"
-        amount_major = amount_cents / 100.0   # Pesapal expects major units
+        
+        # ── FIXED: UGX has no cents. Do not divide by 100. ─────
+        amount_major = float(amount_cents)
 
         payment = PaymentTransaction.objects.create(
             user=request.user,
@@ -729,13 +723,6 @@ class PurchaseTokensView(APIView):
 # =============================================================================
 
 class PesapalIPNView(APIView):
-    """
-    Webhook endpoint Pesapal calls when a transaction status changes.
-    Must respond 200 quickly; Pesapal retries on failure.
-
-    Accepts both GET query params and POST body — Pesapal's IPN shape
-    depends on how the URL was registered.
-    """
     permission_classes = [AllowAny]
     authentication_classes = []
 
@@ -776,14 +763,11 @@ class PesapalIPNView(APIView):
         ).first()
         if payment is None:
             logger.warning("Pesapal IPN for unknown reference %s", merchant_ref)
-            # Still respond 200 so Pesapal doesn't retry forever.
             return Response({"status": "ignored"})
 
-        # Idempotent: if already SUCCESS, don't double-credit
         if payment.status == PaymentTransaction.Status.SUCCESS:
             return Response({"status": "already-processed"})
 
-        # ── Verify with Pesapal (never trust the webhook body) ─
         try:
             status_data = get_transaction_status(tracking_id)
         except PesapalError as exc:
@@ -833,20 +817,8 @@ class PesapalIPNView(APIView):
 
 
 class PaymentStatusView(APIView):
-    """
-    Frontend polls this after returning from the Pesapal redirect.
-    GET /api/payments/<transaction_id>/status/
-
-    If the local row is still PENDING, this view actively asks Pesapal
-    for the current status and syncs the row. That way a broken/missing
-    IPN (or a dead tunnel) doesn't leave payments stuck forever.
-
-    A short cache guard prevents the frontend's ~2s poll from hammering
-    Pesapal's API — we only hit them once per cooldown window per row.
-    """
     permission_classes = [permissions.IsAuthenticated]
 
-    # Minimum seconds between Pesapal lookups for the same transaction.
     PESAPAL_LOOKUP_COOLDOWN = 10
 
     def get(self, request, transaction_id):
@@ -854,7 +826,6 @@ class PaymentStatusView(APIView):
             PaymentTransaction, pk=transaction_id, user=request.user
         )
 
-        # Terminal states — nothing to do, return what we have.
         if payment.status in (
             PaymentTransaction.Status.SUCCESS,
             PaymentTransaction.Status.FAILED,
@@ -862,7 +833,6 @@ class PaymentStatusView(APIView):
         ):
             return Response(PaymentTransactionStatusSerializer(payment).data)
 
-        # PENDING: only hit Pesapal if we haven't checked recently.
         cache_key = f"pesapal:status-check:{payment.id}"
         if payment.pesapal_tracking_id and not cache.get(cache_key):
             cache.set(cache_key, 1, self.PESAPAL_LOOKUP_COOLDOWN)
@@ -901,10 +871,6 @@ class PaymentStatusView(APIView):
                     err_code == "payment_details_not_found"
                     or "invalid" in desc
                 ):
-                    # Order exists on Pesapal, but no payment was ever
-                    # attempted against it. Student opened the Pesapal
-                    # page and left without paying. Resolve to FAILED so
-                    # the frontend stops polling.
                     payment.mark_failed(
                         reason="No payment attempted"
                     )
@@ -912,7 +878,6 @@ class PaymentStatusView(APIView):
                         "Payment %s marked FAILED (abandoned) via poll",
                         payment.id,
                     )
-                # else: still genuinely pending on Pesapal — leave as-is.
             except PesapalError as exc:
                 logger.warning(
                     "Poll could not verify payment %s with Pesapal: %s",
@@ -924,10 +889,6 @@ class PaymentStatusView(APIView):
 
 
 class RegisterIPNView(APIView):
-    """
-    One-time admin endpoint: register our IPN URL with Pesapal.
-    POST /api/payments/register-ipn/  →  { ipn_id, message }
-    """
     permission_classes = [permissions.IsAuthenticated, IsAppAdmin]
 
     def post(self, request):
@@ -962,7 +923,12 @@ class AIServiceConfigView(APIView):
             AIServiceConfig.load(), data=request.data, partial=True
         )
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        
+        # ── FIXED: Track who made the change ──
+        obj = serializer.save()
+        obj.updated_by = request.user
+        obj.save(update_fields=["updated_by"])
+        
         reset_config_cache()
         return Response(serializer.data)
 
@@ -996,14 +962,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
     @staticmethod
     def _validate_file(serializer):
-        """
-        Reject only extensions the extractor cannot handle.
-
-        The full list of supported formats lives in
-        campusos/utils/text_extraction.py. If you add a format here,
-        you must also add a matching handler there — otherwise
-        content_text stays empty and AI evaluation fails silently.
-        """
         upload = serializer.validated_data.get("file")
         if upload is None:
             return
@@ -1041,11 +999,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
     @staticmethod
     def _warn_if_empty_extraction(document, context: str):
-        """
-        Log a warning when extraction produced no usable text.
-        This is the canary that catches format mismatches — you see
-        it at upload time, not 3 minutes later when AI eval errors.
-        """
         text = document.content_text or ""
         if len(text.strip()) < 50:
             logger.warning(
@@ -1166,7 +1119,8 @@ class LecturerDashboardView(APIView):
             "published_exams": my_exams.filter(is_published=True).count(),
             "rubrics": my_rubrics.count(),
             "pending_submissions": to_review.count(),
-            "tokens_remaining": credit.remaining_tokens,
+            # ── FIXED: Hide negative balance from UI ──
+            "tokens_remaining": max(0, credit.remaining_tokens),
         }
 
         recent_docs = list(
@@ -1265,7 +1219,8 @@ class StudentDashboardView(APIView):
             "reviewed": my_submissions.filter(
                 evaluation_status=ResearchSubmission.Status.REVIEWED
             ).count(),
-            "tokens_remaining": credit.remaining_tokens,
+            # ── FIXED: Hide negative balance from UI ──
+            "tokens_remaining": max(0, credit.remaining_tokens),
             "exams_attempted": my_attempts.count(),
             "exams_graded": my_attempts.filter(
                 status=ExamAttempt.Status.GRADED
@@ -1973,11 +1928,6 @@ class ResearchSubmissionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="unapprove")
     def unapprove(self, request, pk=None):
-        """
-        Revert a REVIEWED submission back to EVALUATED.
-        Same permission model as approve: only the course lecturer or
-        the rubric author (or an admin) can revert.
-        """
         submission = self.get_object()
         user = request.user
 
@@ -2022,10 +1972,6 @@ class ResearchSubmissionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="comments")
     def comments(self, request, pk=None):
-        """
-        Update lecturer comments on a submission without changing
-        its evaluation status. Useful for adding notes after approval.
-        """
         submission = self.get_object()
         user = request.user
 
@@ -2078,6 +2024,10 @@ class ResearchSubmissionViewSet(viewsets.ModelViewSet):
                 {"error": "No text extracted from the document. Re-upload the file."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # ── FIXED: Reset status so the worker doesn't skip it ──
+        submission.evaluation_status = ResearchSubmission.Status.PENDING
+        submission.save(update_fields=["evaluation_status"])
 
         kick_off_evaluation(submission.id)
 
@@ -2416,7 +2366,6 @@ class ExamAttemptViewSet(viewsets.ModelViewSet):
         if not is_admin(request.user):
             attempts = attempts.filter(student__user=request.user)
 
-        # Phase 1: lock, mark SUBMITTED, grade MCQs. Release lock.
         with transaction.atomic():
             attempt = get_object_or_404(
                 attempts.select_for_update(of=("self",)), pk=pk
@@ -2426,7 +2375,6 @@ class ExamAttemptViewSet(viewsets.ModelViewSet):
         if isinstance(prepare_result, Response):
             return prepare_result
 
-        # Phase 2: dispatch AI grading outside the transaction.
         return _perform_exam_submit_grade(request, prepare_result)
 
 

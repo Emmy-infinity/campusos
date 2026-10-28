@@ -1,6 +1,8 @@
 # admin.py
+from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
+from django.utils.html import format_html
 
 from unfold.admin import ModelAdmin
 
@@ -17,7 +19,6 @@ from .models import (
 # Users & profiles
 # =============================================================================
 
-# --- Custom user model needs UserAdmin + Unfold's ModelAdmin combined ---
 @admin.register(User)
 class UserAdmin(ModelAdmin, BaseUserAdmin):
     list_display = ('username', 'email', 'first_name', 'last_name', 'role', 'is_staff', 'is_active')
@@ -82,8 +83,10 @@ class DocumentAdmin(ModelAdmin):
     list_filter = ('category', 'visibility', 'course')
     search_fields = ('title', 'description', 'content_text', 'uploaded_by__email')
     autocomplete_fields = ('uploaded_by', 'course')
-    readonly_fields = ('search_vector', 'created_at', 'updated_at')
+    readonly_fields = ('search_vector', 'content_pages', 'created_at', 'updated_at')
     date_hierarchy = 'created_at'
+    
+    save_on_top = True  # ← Keeps the Save button visible at the top
 
 
 @admin.register(Highlight)
@@ -115,11 +118,10 @@ class QuestionAdmin(ModelAdmin):
     search_fields = ('text', 'explanation', 'model_answer', 'bank__title')
     autocomplete_fields = ('bank',)
     readonly_fields = ('created_at', 'updated_at')
+    
+    save_on_top = True  # ← Keeps the Save button visible at the top
 
 
-# ExamQuestion uses a `through` relationship on Exam.questions, so
-# filter_horizontal / filter_vertical are NOT allowed on ExamAdmin.
-# Instead, edit exam questions via this inline on the Exam change page.
 class ExamQuestionInline(admin.TabularInline):
     model = ExamQuestion
     extra = 1
@@ -136,6 +138,8 @@ class ExamAdmin(ModelAdmin):
     readonly_fields = ('created_at', 'updated_at')
     date_hierarchy = 'start_time'
     inlines = (ExamQuestionInline,)
+    
+    save_on_top = True  # ← Keeps the Save button visible at the top
 
 
 @admin.register(ExamQuestion)
@@ -186,6 +190,8 @@ class RubricAdmin(ModelAdmin):
     search_fields = ('title', 'description', 'course__code')
     autocomplete_fields = ('course', 'created_by')
     readonly_fields = ('created_at', 'updated_at')
+    
+    save_on_top = True  # ← Keeps the Save button visible at the top
 
 
 @admin.register(ResearchSubmission)
@@ -198,8 +204,10 @@ class ResearchSubmissionAdmin(ModelAdmin):
     list_filter = ('evaluation_status', 'course', 'rubric')
     search_fields = ('document__title', 'student__student_id', 'student__user__email', 'lecturer_comments')
     autocomplete_fields = ('student', 'course', 'document', 'rubric', 'approved_by')
-    readonly_fields = ('submitted_at', 'approved_at')
+    readonly_fields = ('submitted_at', 'approved_at', 'ai_feedback')
     date_hierarchy = 'submitted_at'
+    
+    save_on_top = True  # ← FIXED: The submission form now has buttons at the top
 
 
 @admin.register(RubricEvaluation)
@@ -231,25 +239,136 @@ class CorrectionReportAdmin(ModelAdmin):
 
 @admin.register(AIServiceConfig)
 class AIServiceConfigAdmin(ModelAdmin):
+    """
+    Singleton admin for AI service configuration.
+    """
     list_display = (
-        'id',
-        'ai_highlighting_enabled',
-        'ai_marking_enabled',
-        'ai_research_guidance_enabled',
-        'token_cost_cents',
-        'free_tokens_per_month',
-        'allow_pay_as_you_go',
-        'max_purchasable_tokens',
-        'updated_at',
+        "ai_highlighting_enabled",
+        "ai_marking_enabled",
+        "ai_research_guidance_enabled",
+        "token_cost_cents",
+        "updated_at",
     )
-    readonly_fields = ('updated_at',)
+    readonly_fields = (
+        "updated_at",
+        "updated_by",
+        "env_highlight_model",
+        "env_grading_model",
+        "env_research_model",
+        "env_highlight_max_tokens",
+        "env_grading_max_tokens",
+        "env_research_max_tokens",
+        "env_repair_attempts",
+        "env_temperature",
+    )
+    
+    # The tuple syntax ("field", "env_field") creates a responsive 2-column grid.
+    fieldsets = (
+        ("Feature toggles", {
+            "fields": (
+                "ai_highlighting_enabled",
+                "ai_marking_enabled",
+                "ai_research_guidance_enabled",
+            ),
+            "description": "Users get a 403 with a clear message when a feature is disabled.",
+        }),
+        ("Models (leave blank to inherit from .env)", {
+            "fields": (
+                ("highlight_model", "env_highlight_model"),
+                ("grading_model", "env_grading_model"),
+                ("research_model", "env_research_model"),
+            ),
+            "description": "Format: provider/model-name. The block on the right shows the inherited .env value.",
+        }),
+        ("Token budgets (leave blank to inherit from .env)", {
+            "fields": (
+                ("highlight_max_tokens", "env_highlight_max_tokens"),
+                ("grading_max_tokens", "env_grading_max_tokens"),
+                ("research_max_tokens", "env_research_max_tokens"),
+            ),
+            "description": "Caps the model's output length per request.",
+        }),
+        ("Reliability & sampling (leave blank to inherit from .env)", {
+            "fields": (
+                ("repair_attempts", "env_repair_attempts"),
+                ("temperature", "env_temperature"),
+            ),
+            "description": "0 repair attempts disables repair. Temperature 0.0 is deterministic.",
+        }),
+        ("Pricing & allowance", {
+            "fields": (
+                "token_cost_cents",
+                "free_tokens_per_month",
+                "allow_pay_as_you_go",
+                "max_purchasable_tokens",
+            ),
+        }),
+        ("Audit", {
+            "fields": ("updated_at", "updated_by"),
+            "classes": ("collapse",),
+        }),
+    )
+    
+    save_on_top = True  # ← Keeps the Save button visible at the top
+
+    # ── env display (readonly; renders as compact grey blocks) ──────
+
+    def _env_html(self, key, default="(unset)"):
+        val = getattr(settings, key, default)
+        return format_html(
+            '<div style="padding: 8px 12px; background-color: var(--unfold-bg-secondary, #f3f4f6); '
+            'border: 1px solid var(--unfold-border, #d1d5db); border-radius: 6px; '
+            'font-family: monospace; font-size: 0.85em; line-height: 1.4; '
+            'word-break: break-all; color: var(--unfold-text-secondary, #4b5563);">'
+            '<div style="font-weight: 600; margin-bottom: 4px;">{}</div>'
+            '<div>{}</div>'
+            '</div>',
+            key, val
+        )
+
+    @admin.display(description="")
+    def env_highlight_model(self, obj):
+        return self._env_html("AI_DEFAULT_MODEL")
+
+    @admin.display(description="")
+    def env_grading_model(self, obj):
+        return self._env_html("AI_GRADING_MODEL")
+
+    @admin.display(description="")
+    def env_research_model(self, obj):
+        return self._env_html("AI_DEFAULT_MODEL")
+
+    @admin.display(description="")
+    def env_highlight_max_tokens(self, obj):
+        return self._env_html("AI_HIGHLIGHT_MAX_TOKENS")
+
+    @admin.display(description="")
+    def env_grading_max_tokens(self, obj):
+        return self._env_html("AI_GRADING_MAX_TOKENS")
+
+    @admin.display(description="")
+    def env_research_max_tokens(self, obj):
+        return self._env_html("AI_RESEARCH_MAX_TOKENS")
+
+    @admin.display(description="")
+    def env_repair_attempts(self, obj):
+        return self._env_html("AI_REPAIR_ATTEMPTS", 1)
+
+    @admin.display(description="")
+    def env_temperature(self, obj):
+        return self._env_html("AI_TEMPERATURE", 0.0)
+
+    # ── singleton guards ─────────────────────────────────────────────
 
     def has_add_permission(self, request):
-        # Singleton — only allow editing the existing row.
         return not AIServiceConfig.objects.exists()
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+    def save_model(self, request, obj, form, change):
+        obj.updated_by = request.user
+        super().save_model(request, obj, form, change)
 
 
 @admin.register(UserAICredit)
@@ -262,21 +381,36 @@ class UserAICreditAdmin(ModelAdmin):
 
 @admin.register(UserAIUsage)
 class UserAIUsageAdmin(ModelAdmin):
-    list_display = ('user', 'feature', 'tokens_used', 'cost_cents', 'related_document', 'related_answer', 'created_at')
+    list_display = (
+        'user', 'feature', 'tokens_used', 'cost_display',
+        'related_document', 'related_answer', 'created_at',
+    )
     list_filter = ('feature',)
     search_fields = ('user__username', 'user__email', 'feature')
     autocomplete_fields = ('user', 'related_document', 'related_answer')
-    readonly_fields = ('created_at',)
+    readonly_fields = ('tokens_used', 'cost_cents', 'created_at')
     date_hierarchy = 'created_at'
+
+    @admin.display(description="Cost (cents)", ordering='cost_cents')
+    def cost_display(self, obj):
+        return f"{obj.cost_cents:.6f}"
 
 
 @admin.register(PaymentTransaction)
 class PaymentTransactionAdmin(ModelAdmin):
-    list_display = ('id', 'user', 'amount_cents', 'tokens_purchased', 'status', 'transaction_id', 'created_at', 'completed_at')
+    list_display = (
+        'id', 'user', 'amount_cents', 'tokens_purchased', 'status',
+        'transaction_id', 'created_at', 'completed_at',
+    )
     list_filter = ('status',)
-    search_fields = ('user__username', 'user__email', 'transaction_id')
+    search_fields = ('user__username', 'user__email', 'transaction_id',
+                     'pesapal_tracking_id', 'pesapal_merchant_reference')
     autocomplete_fields = ('user',)
-    readonly_fields = ('created_at', 'completed_at')
+    readonly_fields = (
+        'created_at', 'completed_at',
+        'pesapal_tracking_id', 'pesapal_merchant_reference',
+        'redirect_url', 'raw_pesapal_response',
+    )
     date_hierarchy = 'created_at'
 
 

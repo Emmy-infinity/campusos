@@ -18,15 +18,21 @@ Contents
 Idempotency: an answer is only ever written while its score is still NULL
 (conditional UPDATE), and finalize_attempt() can be re-run safely, so a
 redelivered or parallel grading task never double-charges an answer.
+
+Admin-tunable settings (AIServiceConfig) are resolved through resolve_*()
+helpers: per-feature model, max_tokens, repair attempts, temperature. All
+fall back to settings.py / env when the DB field is blank, so a fresh
+install with no config row behaves identically to the pre-Phase-2 code.
 """
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 import uuid
 from collections import namedtuple
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from functools import partial
@@ -52,16 +58,19 @@ logger = logging.getLogger(__name__)
 TWO_PLACES = Decimal("0.01")
 
 # -----------------------------------------------------------------------------
-# Settings
+# Settings (env-driven; no secrets in source)
 # -----------------------------------------------------------------------------
 
-OPENROUTER_API_KEY = "REMOVED"
+# ── FIX #1: no hardcoded key. get_openrouter_client() reads
+#          settings.AI_API_KEY (env: OPENROUTER_API_KEY) and fails loudly
+#          if it's missing. ──
 
 DEFAULT_MODEL = getattr(settings, "AI_DEFAULT_MODEL", "deepseek/deepseek-v4-flash")
 GRADING_MODEL = getattr(settings, "AI_GRADING_MODEL", DEFAULT_MODEL)
 
 AI_MAX_INPUT_CHARS = getattr(settings, "AI_MAX_INPUT_CHARS", 30000)
-AI_MAX_ANSWER_CHARS = 10000
+# ── FIX #10: read from settings instead of hardcoding ──
+AI_MAX_ANSWER_CHARS = getattr(settings, "AI_MAX_ANSWER_CHARS", 10000)
 MAX_AI_HIGHLIGHTS = 10
 
 HIGHLIGHT_MAX_TOKENS = getattr(settings, "AI_HIGHLIGHT_MAX_TOKENS", 1500)
@@ -77,6 +86,8 @@ AI_GRADING_WORKERS = getattr(settings, "AI_GRADING_WORKERS", 4)
 
 MIN_SENTENCE_CHARS = 25
 MAX_PROMPT_SENTENCE_CHARS = 300
+
+CONFIG_VERSION_KEY = "ai:config_version"
 
 
 # -----------------------------------------------------------------------------
@@ -124,25 +135,105 @@ class AlreadyGraded(Exception):
 
 
 # -----------------------------------------------------------------------------
-# Config (per-process cache so we don't hit the DB on every call)
+# Config (per-process cache, invalidated by Redis version counter)
 # -----------------------------------------------------------------------------
 
 _config_cache = (0.0, None)
+_config_version = 0
+
+
+def _remote_config_version():
+    try:
+        return cache.get(CONFIG_VERSION_KEY) or 0
+    except Exception:
+        # Cache backend down — fall back to time-based refresh only.
+        return _config_version
 
 
 def get_config():
-    global _config_cache
+    """
+    Per-process cached AIServiceConfig. Invalidates when:
+      - the Redis config-version counter changes (admin saved a change), or
+      - AI_CONFIG_TTL seconds have elapsed (fallback if Redis is down).
+    """
+    global _config_cache, _config_version
     fetched_at, config = _config_cache
-    if config is None or time.monotonic() - fetched_at > AI_CONFIG_TTL:
+    remote_version = _remote_config_version()
+
+    needs_refresh = (
+        config is None
+        or remote_version != _config_version
+        or time.monotonic() - fetched_at > AI_CONFIG_TTL
+    )
+    if needs_refresh:
         config = AIServiceConfig.load()
         _config_cache = (time.monotonic(), config)
+        _config_version = remote_version
     return config
 
 
 def reset_config_cache():
-    """Call after saving AIServiceConfig so this process sees it immediately."""
-    global _config_cache
+    """Invalidate this process's cache. Tests and management commands."""
+    global _config_cache, _config_version
     _config_cache = (0.0, None)
+    _config_version = -1
+
+
+# ── Resolvers: DB override → env default → hardcoded default ──
+# These use getattr(cfg, field, None), so they work before the
+# Phase-2 migration adds the new fields — a blank DB means "use env".
+
+def resolve_model(feature):
+    """
+    feature ∈ {"highlight", "marking", "research_guidance"}.
+    Blank DB override → env default (AI_GRADING_MODEL for marking, else
+    AI_DEFAULT_MODEL).
+    """
+    cfg = get_config()
+    override = {
+        "highlight": getattr(cfg, "highlight_model", ""),
+        "marking": getattr(cfg, "grading_model", ""),
+        "research_guidance": getattr(cfg, "research_model", ""),
+    }.get(feature, "")
+    override = (override or "").strip()
+    if override:
+        return override
+    if feature == "marking":
+        return getattr(settings, "AI_GRADING_MODEL", DEFAULT_MODEL)
+    return getattr(settings, "AI_DEFAULT_MODEL", DEFAULT_MODEL)
+
+
+def resolve_max_tokens(feature):
+    """DB value → env fallback → hardcoded per-feature default."""
+    cfg = get_config()
+    db_value = {
+        "highlight": getattr(cfg, "highlight_max_tokens", None),
+        "marking": getattr(cfg, "grading_max_tokens", None),
+        "research_guidance": getattr(cfg, "research_max_tokens", None),
+    }.get(feature)
+    if db_value:
+        return db_value
+    return {
+        "highlight": getattr(settings, "AI_HIGHLIGHT_MAX_TOKENS", 1500),
+        "marking": getattr(settings, "AI_GRADING_MAX_TOKENS", 1000),
+        "research_guidance": getattr(settings, "AI_RESEARCH_MAX_TOKENS", 2000),
+    }.get(feature, 1000)
+
+
+def resolve_repair_attempts():
+    cfg = get_config()
+    value = getattr(cfg, "repair_attempts", None)
+    if value is not None:
+        return value
+    return getattr(settings, "AI_REPAIR_ATTEMPTS", 1)
+
+
+def resolve_temperature():
+    cfg = get_config()
+    value = getattr(cfg, "temperature", None)
+    if value is not None:
+        return float(value)
+    return 0.0
 
 
 # -----------------------------------------------------------------------------
@@ -163,13 +254,25 @@ def _is_openrouter():
 
 
 def get_openrouter_client():
-    """OpenAI-compatible client: OpenRouter by default, or any local server
-    (vLLM etc.) when settings.AI_BASE_URL is set."""
+    """
+    Build (once) an OpenAI-compatible client. Reads the key from
+    settings.AI_API_KEY (env: OPENROUTER_API_KEY). Fails loudly if missing —
+    we never silently fall back to a baked-in key.
+    """
     global _openrouter_client
     if _openrouter_client is None:
+        api_key = (
+            getattr(settings, "AI_API_KEY", "")
+            or os.environ.get("OPENROUTER_API_KEY", "")
+        )
+        if not api_key:
+            raise AIPermanentError(
+                "AI_API_KEY is not configured. Set OPENROUTER_API_KEY in the "
+                "environment (or AI_API_KEY in settings) and restart the worker."
+            )
         _openrouter_client = OpenAI(
             base_url=_ai_base_url(),
-            api_key=getattr(settings, "AI_API_KEY", "") or OPENROUTER_API_KEY,
+            api_key=api_key,
             timeout=getattr(settings, "OPENROUTER_TIMEOUT", 60),
             max_retries=getattr(settings, "OPENROUTER_SDK_RETRIES", 2),
             default_headers={
@@ -180,11 +283,19 @@ def get_openrouter_client():
     return _openrouter_client
 
 
-def call_openrouter(messages, model=None, max_tokens=500, temperature=0.0,
+def reset_openrouter_client():
+    """Call if you change AI_API_KEY / AI_BASE_URL at runtime (rare)."""
+    global _openrouter_client
+    _openrouter_client = None
+
+
+def call_openrouter(messages, model=None, max_tokens=500, temperature=None,
                     json_mode=True, label=""):
     """Return AIResult(text, total_tokens). Raises AITransientError / AIPermanentError."""
     client = get_openrouter_client()
     model = model or DEFAULT_MODEL
+    if temperature is None:
+        temperature = resolve_temperature()
     kwargs = dict(model=model, messages=messages,
                   max_tokens=max_tokens, temperature=temperature)
     if json_mode and getattr(settings, "OPENROUTER_JSON_MODE", True):
@@ -223,6 +334,18 @@ def call_openrouter(messages, model=None, max_tokens=500, temperature=0.0,
     total = getattr(usage, "total_tokens", None) or 0
     details = getattr(usage, "completion_tokens_details", None)
     reasoning = getattr(details, "reasoning_tokens", None)
+
+    # ── FIX #7: if the provider omits usage, estimate and log a warning.
+    #          Settle will charge the estimate instead of doing nothing. ──
+    if total == 0:
+        prompt_chars = sum(len(m.get("content") or "") for m in messages)
+        completion_chars = len(choice.message.content or "")
+        total = max(1, int((prompt_chars + completion_chars) / 3.5))
+        logger.warning(
+            "ai_call feature=%s model=%s returned no usage; estimated tokens=%s",
+            label, model, total,
+        )
+
     logger.info("ai_call feature=%s model=%s latency=%.2fs tokens=%s reasoning_tokens=%s "
                 "finish=%s max_tokens=%s", label, model, time.monotonic() - started,
                 total, reasoning, choice.finish_reason, max_tokens)
@@ -290,7 +413,8 @@ def cache_key(*parts):
 # -----------------------------------------------------------------------------
 
 def estimate_tokens(text):
-    return max(1, int(len(text) / 3.5))
+    """Conservative estimate. Under-reserving causes silent under-billing."""
+    return max(1, int(len(text) / 3.0))
 
 
 def can_afford(user, prompt_text, max_tokens):
@@ -313,20 +437,40 @@ def reserve_tokens(user, feature, token_count, related_document=None, related_an
 
 
 def settle_tokens(usage, actual_tokens):
-    """Adjust the reservation to actual usage. Call inside the persist transaction."""
+    """
+    Adjust the reservation to actual usage. Call inside the persist transaction.
+
+    Over-reservation  → refund the difference.
+    Under-reservation → charge the overage. If the user can't pay, allow the
+                        balance to go negative rather than refusing to persist
+                        (an exam answer that was already submitted must be
+                        graded; the negative balance blocks future AI calls
+                        until they top up).
+
+    Any change here is rolled back if the persist step raises.
+    """
     if not actual_tokens or actual_tokens <= 0:
         return
     delta = usage.tokens_used - actual_tokens
     if delta == 0:
         return
+
     cost_per_token = get_config().token_cost_cents
     credit = UserAICredit.objects.get(user_id=usage.user_id)
+
     if delta > 0:
         credit.refund_tokens(delta)
-    elif not credit.try_consume(-delta):
-        logger.warning("Could not charge %s extra tokens for usage %s (user %s); "
-                       "keeping the reservation.", -delta, usage.pk, usage.user_id)
-        return
+    else:
+        overage = -delta
+        if not credit.try_consume(overage):
+            logger.warning(
+                "Overage %s tokens for usage %s (user %s); going negative.",
+                overage, usage.pk, usage.user_id,
+            )
+            # Adjust field name if UserAICredit uses a different balance attr.
+            credit.balance_tokens = (credit.balance_tokens or 0) - overage
+            credit.save(update_fields=["balance_tokens"])
+
     usage.tokens_used = actual_tokens
     usage.cost_cents = actual_tokens * cost_per_token
     usage.save(update_fields=["tokens_used", "cost_cents"])
@@ -343,13 +487,13 @@ def release_tokens(usage):
 def _call_validated(messages, model, max_tokens, validate, label):
     """
     Call the model, parse and validate. If the output is invalid, retry up to
-    AI_REPAIR_ATTEMPTS times, showing the model its own output and the error.
-    Returns (data, total_tokens_across_attempts).
+    resolve_repair_attempts() times, showing the model its own output and the
+    error. Returns (data, total_tokens_across_attempts).
     """
     total = 0
     current = list(messages)
     last_error = None
-    repairs_left = AI_REPAIR_ATTEMPTS
+    repairs_left = resolve_repair_attempts()  # ── FIX: DB-tunable ──
     while True:
         try:
             result = call_openrouter(current, model=model, max_tokens=max_tokens, label=label)
@@ -396,7 +540,10 @@ def run_metered_json_call(*, user, feature, messages, max_tokens, model=None,
             logger.info("ai_cache_hit feature=%s", feature)
             return persist(cached) if persist else cached
 
-    prompt = " ".join(m["content"] for m in messages)
+    if not messages:
+        raise AIRequestError("No messages to send.", 400)
+
+    prompt = " ".join(m.get("content") or "" for m in messages)
     reserved = reserve_tokens(user, feature, estimate_tokens(prompt) + max_tokens,
                               related_document=related_document,
                               related_answer=related_answer)
@@ -636,8 +783,11 @@ def validate_findings(data, criterion_names):
                 "suggestion": str(item.get("suggestion") or "")[:500],
             })
 
-    # ── FIX 2: lenient fallback for scanned / unreadable documents ──
     if not cleaned:
+        logger.warning(
+            "validate_findings: model returned no findings; "
+            "overall_score was %s, forcing to 0", overall,
+        )
         names = sorted(criterion_names) if criterion_names else ["Document"]
         for name in names:
             cleaned.append({
@@ -654,26 +804,37 @@ def validate_findings(data, criterion_names):
                     "Google Docs, LaTeX, etc.) and re-submit."
                 ),
             })
-        # If the AI truly failed to produce any evaluation, reflect that
-        # in the overall score too.
         overall = Decimal("0.00")
 
     return {"overall_score": overall, "findings": cleaned}
 
 
 def _paragraph_of(text, char_index):
-    """1-based paragraph number of `char_index` in `text`. Paragraphs are
-    separated by one or more blank lines."""
+    """1-based paragraph number of char_index. Blank lines separate paragraphs."""
     before = text[:char_index]
-    blocks = re.split(r"\n\s*\n", before)
-    return max(1, len(blocks))
+    separators = re.findall(r"\n\s*\n", before)
+    return len(separators) + 1
+
+
+def _find_in_text(text, needle_norm):
+    """
+    Locate needle_norm (already whitespace-collapsed, lowercased) inside
+    text, tolerating arbitrary whitespace runs. Returns a match object
+    positioned in text, or None. This is the only way to get an index that
+    is valid for slicing the ORIGINAL text.
+    """
+    pattern = re.escape(needle_norm).replace(r"\ ", r"\s+")
+    return re.search(pattern, text or "", flags=re.IGNORECASE)
 
 
 def locate_quote(pages, quote):
     """
-    Find `quote` in the page-by-page text and return:
+    Find quote in the page-by-page text and return:
         {"page": int, "paragraph": int, "snippet": str}   or   None
-    Falls back to a shorter prefix match if the exact quote isn't found.
+
+    The match is whitespace-tolerant and case-insensitive. Falls back to a
+    shorter prefix match if the exact quote isn't found (models sometimes
+    paraphrase punctuation).
     """
     if not pages or not quote:
         return None
@@ -684,11 +845,10 @@ def locate_quote(pages, quote):
 
     for p in pages:
         text = p.get("text") or ""
-        norm = re.sub(r"\s+", " ", text).lower()
-        idx = norm.find(quote_norm)
-        if idx != -1:
-            para = _paragraph_of(text, idx)
-            snippet = text[max(0, idx - 40): idx + len(quote) + 40].strip()
+        m = _find_in_text(text, quote_norm)
+        if m:
+            para = _paragraph_of(text, m.start())
+            snippet = text[max(0, m.start() - 40): m.end() + 40].strip()
             return {"page": p["page"], "paragraph": para, "snippet": snippet}
 
     words = quote_norm.split()[:8]
@@ -696,11 +856,10 @@ def locate_quote(pages, quote):
         prefix = " ".join(words)
         for p in pages:
             text = p.get("text") or ""
-            norm = re.sub(r"\s+", " ", text).lower()
-            idx = norm.find(prefix)
-            if idx != -1:
-                para = _paragraph_of(text, idx)
-                snippet = text[max(0, idx - 40): idx + len(prefix) + 40].strip()
+            m = _find_in_text(text, prefix)
+            if m:
+                para = _paragraph_of(text, m.start())
+                snippet = text[max(0, m.start() - 40): m.end() + 40].strip()
                 return {"page": p["page"], "paragraph": para, "snippet": snippet}
 
     return None
@@ -733,10 +892,8 @@ def check_research_ready(submission):
         raise AIRequestError("AI research guidance is currently disabled.", 403)
     if submission.rubric is None:
         raise AIRequestError("No rubric assigned to this submission.")
-    content = submission.document.content_text
-    if not content:
+    if not submission.document.content_text:
         raise AIRequestError("Document text not extracted yet.")
-    # ── FIX 1a: no length check — truncation happens in the operation ──
 
 
 # -----------------------------------------------------------------------------
@@ -772,15 +929,17 @@ def generate_ai_highlights(document_id, user_id):
     if not sentences:
         raise AIRequestError("Document has no sentences long enough to highlight.")
 
+    model = resolve_model("highlight")
+    max_tokens = resolve_max_tokens("highlight")
     return run_metered_json_call(
         user=user,
         feature="highlight",
         messages=build_highlight_messages(content, sentences),
-        max_tokens=HIGHLIGHT_MAX_TOKENS,
-        model=DEFAULT_MODEL,
+        max_tokens=max_tokens,
+        model=model,
         validate=partial(validate_highlights, sentences=sentences),
         persist=partial(_save_highlights, document, user, content),
-        cache_key_=cache_key("highlight", DEFAULT_MODEL, content),
+        cache_key_=cache_key("highlight", model, content),
         related_document=document,
     )
 
@@ -854,7 +1013,7 @@ def _save_grade(answer_pk, grade):
             "feedback": grade["feedback"],
             "criteria_scores": grade["criteria_scores"],
             "graded_by": "ai",
-            "model": GRADING_MODEL,
+            "model": resolve_model("marking"),
         },
     )
     if not updated:
@@ -874,7 +1033,10 @@ def _grade_one(answer, marks, config, raise_transient=False):
         unscored.update(feedback="AI marking is currently disabled; awaiting manual grading.")
         return
 
-    key = cache_key("grade", GRADING_MODEL, question.text, question.model_answer,
+    model = resolve_model("marking")
+    max_tokens = resolve_max_tokens("marking")
+
+    key = cache_key("grade", model, question.text, question.model_answer,
                     json.dumps(question.rubric, sort_keys=True, default=str),
                     marks, text[:AI_MAX_ANSWER_CHARS])
     try:
@@ -882,8 +1044,8 @@ def _grade_one(answer, marks, config, raise_transient=False):
             user=answer.attempt.student.user,
             feature="marking",
             messages=build_grading_messages(question, text, marks),
-            max_tokens=GRADING_MAX_TOKENS,
-            model=GRADING_MODEL,
+            max_tokens=max_tokens,
+            model=model,
             validate=partial(validate_grade, max_marks=marks),
             persist=partial(_save_grade, answer.pk),
             cache_key_=key,
@@ -958,9 +1120,28 @@ def grade_attempt(attempt_id, raise_transient=False):
         for answer_id in ids:
             grade_answer(answer_id, exam_marks, raise_transient=raise_transient)
     else:
+        # ── FIX #3: don't abort the batch on one transient error. ──
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(partial(_grade_in_thread, exam_marks=exam_marks,
-                                  raise_transient=raise_transient), ids))
+            futures = [
+                pool.submit(_grade_in_thread, answer_id, exam_marks,
+                            raise_transient=raise_transient)
+                for answer_id in ids
+            ]
+            first_transient = None
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except AITransientError as exc:
+                    if raise_transient and first_transient is None:
+                        first_transient = exc
+                    else:
+                        logger.warning("Transient grading error (will retry): %s", exc)
+                except Exception as exc:
+                    logger.exception("Unexpected grading error in batch", exc_info=exc)
+
+        if raise_transient and first_transient is not None:
+            raise first_transient
+
     return finalize_attempt(attempt_id, exam_marks)
 
 
@@ -1036,7 +1217,6 @@ def evaluate_research_submission(submission_id):
     pages = submission.document.content_pages
     content = submission.document.content_text
 
-    # ── FIX 1b: truncate to AI_MAX_INPUT_CHARS so long docs never fail ──
     content = (content or "")[:AI_MAX_INPUT_CHARS]
     if pages:
         capped, total = [], 0
@@ -1048,14 +1228,15 @@ def evaluate_research_submission(submission_id):
             capped.append({"page": p["page"], "text": t})
             total += len(t)
         pages = capped or None
-    # ─────────────────────────────────────────────────────────────────
+
+    model = resolve_model("research_guidance")
+    max_tokens = resolve_max_tokens("research_guidance")
 
     if pages:
         def _validate(data):
             return validate_findings(data, criterion_names)
 
         def _persist(cleaned):
-            # Enrich each finding with page/paragraph by locating its quote.
             for f in cleaned["findings"]:
                 loc = locate_quote(pages, f["quote"])
                 if loc:
@@ -1074,12 +1255,12 @@ def evaluate_research_submission(submission_id):
             user=submission.student.user,
             feature="research_guidance",
             messages=build_research_findings_messages(pages, rubric_text),
-            max_tokens=RESEARCH_MAX_TOKENS,
-            model=DEFAULT_MODEL,
+            max_tokens=max_tokens,
+            model=model,
             validate=_validate,
             persist=_persist,
             cache_key_=cache_key(
-                "research_findings", DEFAULT_MODEL,
+                "research_findings", model,
                 rubric_text,
                 f"pages:{len(pages)}",
                 content[:500],
@@ -1092,11 +1273,11 @@ def evaluate_research_submission(submission_id):
         user=submission.student.user,
         feature="research_guidance",
         messages=build_research_messages(content, rubric_text),
-        max_tokens=RESEARCH_MAX_TOKENS,
-        model=DEFAULT_MODEL,
+        max_tokens=max_tokens,
+        model=model,
         validate=partial(validate_rubric_evaluation, criterion_names=criterion_names),
         persist=partial(_save_evaluation, submission),
-        cache_key_=cache_key("research", DEFAULT_MODEL, rubric_text, content),
+        cache_key_=cache_key("research", model, rubric_text, content),
         related_document=submission.document,
     )
 
@@ -1120,12 +1301,13 @@ def expire_attempt(attempt_id, reason="timed_out"):
     """
     with transaction.atomic():
         try:
-            attempt = (
-                ExamAttempt.objects
-                .select_for_update(of=("self",))
-                .select_related("exam")
-                .get(pk=attempt_id)
-            )
+            qs = ExamAttempt.objects.select_related("exam")
+            from django.db import connection
+            if connection.vendor == "postgresql":
+                qs = qs.select_for_update(of=("self",))
+            else:
+                qs = qs.select_for_update()
+            attempt = qs.get(pk=attempt_id)
         except ExamAttempt.DoesNotExist:
             return None
 
@@ -1232,10 +1414,9 @@ def sweep_expired_attempts():
 
 def generate_correction_report(report_id):
     from django.core.files.base import ContentFile
-    from django.utils import timezone
-    import re
     from .models import CorrectionReport
     from .correction_pdf import build_correction_pdf
+    # ── FIX #8: re and timezone come from module scope. ──
 
     try:
         report = CorrectionReport.objects.select_related(
