@@ -262,11 +262,15 @@ STORAGES = {
         "BACKEND": (
             "django.contrib.staticfiles.storage.StaticFilesStorage"
             if DEBUG
-            # Use CompressedStaticFilesStorage (without Manifest) to avoid 500 errors on Render
             else "whitenoise.storage.CompressedStaticFilesStorage" 
         ),
     },
 }
+
+# ─── CRITICAL FIX FOR DJANGO 5.1 + CLOUDINARY_STORAGE ────────────────
+# The cloudinary_storage package still looks for this deprecated setting.
+# We map it to Whitenoise so the collectstatic command doesn't crash.
+STATICFILES_STORAGE = "whitenoise.storage.CompressedStaticFilesStorage"
 
 # Set USE_FINDERS to True so Whitenoise looks inside apps (like unfold and DRF)
 WHITENOISE_USE_FINDERS = True
