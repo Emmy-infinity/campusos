@@ -15,6 +15,10 @@ status endpoint must treat RETRY like PENDING/STARTED (i.e. "still running").
 After the final retry the task gives up and returns the generic error dict
 (for grading, it finalizes with "awaiting manual grading" feedback instead).
 
+The grading task also retries on `django.db.OperationalError` (Postgres
+deadlocks). The `propagate` parameter on run_safely lets that exception
+escape the catch-all so Celery's autoretry_for can handle it with backoff.
+
 Recommended Celery settings (settings.py, with the usual `CELERY_` namespace):
 
     CELERY_BROKER_URL = "redis://localhost:6379/0"
@@ -48,6 +52,7 @@ import random
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
 from django.core.cache import cache
+from django.db import OperationalError
 
 from .ai_services import (
     AIError, AIRequestError, AITransientError, InsufficientTokens,
@@ -77,8 +82,17 @@ def _max_retries(task):
     return 0 if getattr(task.request, "is_eager", False) else task.max_retries
 
 
-def run_safely(task, label, func, *args):
-    """Run func, returning the {"ok": ...} dict; retry transient AI failures."""
+def run_safely(task, label, func, *args, propagate=()):
+    """
+    Run func, returning the {"ok": ...} dict; retry transient AI failures.
+
+    `propagate` is a tuple of exception types that should be re-raised
+    instead of being swallowed. This is used to let Celery's `autoretry_for`
+    handle specific exceptions (e.g. django.db.OperationalError for
+    Postgres deadlock retries on the grading task).
+    """
+    propagate = tuple(propagate) if propagate else ()
+
     try:
         return {"ok": True, "data": func(*args)}
     except InsufficientTokens:
@@ -88,10 +102,13 @@ def run_safely(task, label, func, *args):
     except AITransientError as exc:
         if task.request.retries < _max_retries(task):
             countdown = min(5 * 2 ** task.request.retries, 60) + random.randint(0, 3)
-            logger.info("AI %s transient failure, retry %s/%s in %ss: %s", label,
-                        task.request.retries + 1, _max_retries(task), countdown, exc)
+            logger.info(
+                "AI %s transient failure, retry %s/%s in %ss: %s",
+                label, task.request.retries + 1, _max_retries(task), countdown, exc,
+            )
             raise task.retry(exc=exc, countdown=countdown)
-        logger.warning("AI %s failed after %s retries: %s", label, _max_retries(task), exc)
+        logger.warning("AI %s failed after %s retries: %s",
+                       label, _max_retries(task), exc)
         return _fail(GENERIC_ERROR)
     except AIError as exc:
         logger.warning("AI %s failed: %s", label, exc)
@@ -101,6 +118,14 @@ def run_safely(task, label, func, *args):
         logger.warning("AI %s hit the soft time limit", label)
         return _fail(TIMEOUT_ERROR, 504)
     except Exception as exc:
+        # If the caller asked us to propagate certain exception types
+        # (for Celery's autoretry_for), do that before swallowing.
+        if propagate and isinstance(exc, propagate):
+            logger.info(
+                "AI %s propagating %s for Celery autoretry",
+                label, type(exc).__name__,
+            )
+            raise
         logger.error("Unexpected error in AI %s", label, exc_info=exc)
         return _fail(GENERIC_ERROR)
 
@@ -114,9 +139,23 @@ def highlight_document_task(self, document_id, user_id):
 # Grading is idempotent (only unscored answers are processed, each written with
 # a conditional UPDATE), so it is safe to redeliver after a worker crash:
 # acks_late + reject_on_worker_lost.
-@shared_task(bind=True, name="ai.grade_exam_attempt",
-             acks_late=True, reject_on_worker_lost=True,
-             max_retries=MAX_RETRIES, soft_time_limit=900, time_limit=960)
+#
+# `autoretry_for=(OperationalError,)` catches Postgres deadlocks that can
+# occur when a save-answer races with grading. The two-phase submit view
+# removes most of these, but the retry is a safety net.
+@shared_task(
+    bind=True,
+    name="ai.grade_exam_attempt",
+    acks_late=True,
+    reject_on_worker_lost=True,
+    autoretry_for=(OperationalError,),
+    retry_backoff=2,
+    retry_backoff_max=60,
+    retry_jitter=True,
+    max_retries=MAX_RETRIES,
+    soft_time_limit=900,
+    time_limit=960,
+)
 def grade_exam_attempt_task(self, attempt_id):
     # One grader per attempt: a double-click or duplicate enqueue just reports
     # the current state instead of paying the provider twice. The lock stores
@@ -130,7 +169,15 @@ def grade_exam_attempt_task(self, attempt_id):
         # On the last attempt, stop raising transient errors so unscored answers
         # get their "awaiting manual grading" feedback and the attempt finalizes.
         final_attempt = self.request.retries >= _max_retries(self)
-        return run_safely(self, "exam grading", grade_attempt, attempt_id, not final_attempt)
+        return run_safely(
+            self,
+            "exam grading",
+            grade_attempt,
+            attempt_id,
+            not final_attempt,
+            # Let deadlocks escape run_safely so autoretry_for can retry.
+            propagate=(OperationalError,),
+        )
     finally:
         cache.delete(lock_key)
 
@@ -138,7 +185,8 @@ def grade_exam_attempt_task(self, attempt_id):
 @shared_task(bind=True, name="ai.evaluate_research",
              max_retries=MAX_RETRIES, soft_time_limit=400, time_limit=430)
 def evaluate_research_task(self, submission_id):
-    return run_safely(self, "research evaluation", evaluate_research_submission, submission_id)
+    return run_safely(self, "research evaluation",
+                      evaluate_research_submission, submission_id)
 
 
 @shared_task(name="ai.reset_monthly_allowances")
@@ -161,10 +209,11 @@ def sweep_expired_attempts_task():
     try:
         result = sweep_expired_attempts()
         return {"ok": True, "data": result}
-    except Exception as exc:
+    except Exception:
         logger.exception("sweep_expired_attempts_task failed")
         return _fail(GENERIC_ERROR)
-    
+
+
 @shared_task(bind=True, name="ai.generate_correction_report",
              acks_late=True, reject_on_worker_lost=True,
              max_retries=2, soft_time_limit=240, time_limit=300)

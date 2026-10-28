@@ -19,7 +19,7 @@ from corsheaders.defaults import default_headers
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # ═════════════════════════ SWITCHES ═════════════════════════
-DEBUG = True                        # False for real production (turns on HTTPS rules)
+DEBUG = True                      # False for real production (turns on HTTPS rules)
 CELERY_TASK_ALWAYS_EAGER = True     # True = run tasks inside the request (no worker needed)
 AI_FALLBACK_TO_EAGER = True         # broker unreachable -> run the task inline instead of failing
 REDIS_URL = "redis://127.0.0.1:6379"
@@ -392,11 +392,18 @@ CORRECTION_BRAND_COLOR = "#0d47a1"
 CORRECTION_LOGO_PATH = ""
 
 # ─── Document Upload Settings ───────────────────────────────────────
+
 DOCUMENT_ALLOWED_EXTENSIONS = {
-    ".pdf", ".doc", ".docx", ".odt",
-    ".txt", ".md", ".ppt", ".pptx",
-    ".xls", ".xlsx", ".csv", ".rtf",
+    ".pdf",
+    ".docx", ".doc",
+    ".odt",
+    ".rtf",
+    ".pptx", ".ppt",
+    ".xlsx", ".xls",
+    ".csv",
+    ".txt", ".md",
 }
+
 
 DOCUMENT_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 

@@ -31,3 +31,12 @@ redis
 
 reportlab
 Pillow
+PyMuPDF>=1.24.0
+python-docx>=1.1.0
+python-pptx>=1.0.2
+odfpy>=1.4.1
+
+# Add these:
+striprtf>=0.0.28
+openpyxl>=3.1.0
+xlrd>=2.0.1

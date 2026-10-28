@@ -254,7 +254,22 @@ def accepted(task_id):
     )
 
 
-def _perform_exam_submit(request, attempt):
+# ─── Exam submission — two-phase, deadlock-free ─────────────────────
+#
+# Phase 1 (prepare): runs inside the caller's transaction, holds the
+#   attempt lock, marks SUBMITTED, grades MCQs synchronously.
+#   Returns either a terminal Response (no AI needed) or a small dict
+#   of state needed for phase 2.
+#
+# Phase 2 (grade): runs OUTSIDE the transaction, after the lock has
+#   been released. Dispatches the AI grading task. This is what
+#   prevents deadlocks with concurrent save-answer calls.
+
+def _perform_exam_submit_prepare(attempt):
+    """
+    Phase 1 — synchronous portion of exam submission.
+    Assumes caller holds the row lock.
+    """
     if attempt.status != ExamAttempt.Status.IN_PROGRESS:
         return Response(
             {"error": "Attempt is already submitted or graded."},
@@ -273,6 +288,7 @@ def _perform_exam_submit(request, attempt):
     exam_marks = get_exam_question_marks(attempt.exam)
     grade_mcq_answers(attempt, exam_marks)
 
+    # No structured answers → finalize now, no AI needed.
     if not has_structured_answers(attempt, exam_marks):
         result = finalize_attempt(attempt.id, exam_marks)
         attempt.refresh_from_db()
@@ -287,9 +303,30 @@ def _perform_exam_submit(request, attempt):
             status=status.HTTP_200_OK,
         )
 
-    mode, payload = dispatch(grade_exam_attempt_task, [attempt.id], request.user)
+    # Structured answers exist → hand off to phase 2.
+    return {"attempt_id": attempt.id}
 
-    if mode == "sync" and task_ok(payload):
+
+def _perform_exam_submit_grade(request, payload):
+    """
+    Phase 2 — asynchronous AI grading.
+    Runs outside any transaction and does NOT hold the attempt lock.
+    """
+    attempt_id = payload["attempt_id"]
+
+    mode, task_result = dispatch(
+        grade_exam_attempt_task, [attempt_id], request.user
+    )
+
+    try:
+        attempt = ExamAttempt.objects.get(pk=attempt_id)
+    except ExamAttempt.DoesNotExist:
+        return Response(
+            {"error": "Attempt disappeared during grading."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    if mode == "sync" and task_ok(task_result):
         attempt.refresh_from_db()
         graded = attempt.status == ExamAttempt.Status.GRADED
         return Response(
@@ -300,20 +337,24 @@ def _perform_exam_submit(request, attempt):
                 "status": attempt.status,
                 "score": str(attempt.score) if attempt.score is not None else None,
                 "pending_manual_grading":
-                    (payload.get("data") or {}).get("pending_manual_grading"),
+                    (task_result.get("data") or {}).get("pending_manual_grading"),
             },
             status=status.HTTP_200_OK,
         )
+
     if mode == "async":
         return Response(
-            {"message": "Exam submitted. Marking is in progress.",
-             "attempt_id": attempt.id, "status": attempt.status,
-             "task_id": payload},
+            {
+                "message": "Exam submitted. Marking is in progress.",
+                "attempt_id": attempt.id,
+                "status": attempt.status,
+                "task_id": task_result,
+            },
             status=status.HTTP_202_ACCEPTED,
         )
 
-    resp = (task_failed_response(payload) if mode == "sync"
-            else task_error_response(payload))
+    resp = (task_failed_response(task_result) if mode == "sync"
+            else task_error_response(task_result))
     resp.data["attempt_id"] = attempt.id
     resp.data["status"] = attempt.status
     resp.data["message"] = "Exam submitted but AI marking failed."
@@ -448,11 +489,19 @@ class ExamSubmitView(APIView):
         if not is_admin(request.user):
             attempts = attempts.filter(student__user=request.user)
 
+        # Phase 1: mark SUBMITTED + grade MCQs, then release the lock.
         with transaction.atomic():
             attempt = get_object_or_404(
                 attempts.select_for_update(of=("self",)), pk=attempt_id
             )
-            return _perform_exam_submit(request, attempt)
+            prepare_result = _perform_exam_submit_prepare(attempt)
+
+        # If we already have a terminal response, return it.
+        if isinstance(prepare_result, Response):
+            return prepare_result
+
+        # Phase 2: dispatch AI grading outside the transaction.
+        return _perform_exam_submit_grade(request, prepare_result)
 
 
 # =============================================================================
@@ -947,41 +996,89 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
     @staticmethod
     def _validate_file(serializer):
+        """
+        Reject only extensions the extractor cannot handle.
+
+        The full list of supported formats lives in
+        campusos/utils/text_extraction.py. If you add a format here,
+        you must also add a matching handler there — otherwise
+        content_text stays empty and AI evaluation fails silently.
+        """
         upload = serializer.validated_data.get("file")
         if upload is None:
             return
-        allowed = getattr(settings, "DOCUMENT_ALLOWED_EXTENSIONS",
-                          {".pdf", ".doc", ".docx", ".txt", ".md", ".ppt", ".pptx"})
+
+        allowed = getattr(
+            settings,
+            "DOCUMENT_ALLOWED_EXTENSIONS",
+            {
+                ".pdf", ".docx", ".doc",
+                ".odt", ".rtf",
+                ".pptx", ".ppt",
+                ".xlsx", ".xls", ".csv",
+                ".txt", ".md",
+            },
+        )
         max_bytes = getattr(settings, "DOCUMENT_MAX_UPLOAD_BYTES", 25 * 1024 * 1024)
         extension = os.path.splitext(upload.name)[1].lower()
+
         if extension not in allowed:
-            raise DRFValidationError(
-                {"file": [f"File type '{extension}' is not allowed."]}
-            )
+            friendly = ", ".join(sorted(allowed))
+            raise DRFValidationError({
+                "file": [
+                    f"File type '{extension}' is not supported. "
+                    f"Allowed formats: {friendly}."
+                ]
+            })
+
         if upload.size > max_bytes:
-            raise DRFValidationError(
-                {"file": [f"File is too large (max {max_bytes // (1024 * 1024)} MB)."]}
+            raise DRFValidationError({
+                "file": [
+                    f"File is too large "
+                    f"(max {max_bytes // (1024 * 1024)} MB)."
+                ]
+            })
+
+    @staticmethod
+    def _warn_if_empty_extraction(document, context: str):
+        """
+        Log a warning when extraction produced no usable text.
+        This is the canary that catches format mismatches — you see
+        it at upload time, not 3 minutes later when AI eval errors.
+        """
+        text = document.content_text or ""
+        if len(text.strip()) < 50:
+            logger.warning(
+                "Document %s (%s) %s but extraction produced %d chars. "
+                "This document cannot be AI-evaluated.",
+                document.id, document.file.name, context, len(text),
             )
 
     def perform_create(self, serializer):
         self._validate_course(serializer)
         self._validate_file(serializer)
         document = serializer.save(uploaded_by=self.request.user)
+
         text, pages = extract_text_and_pages(document.file)
         document.content_text = text
         document.content_pages = pages
         document.save(update_fields=["content_text", "content_pages"])
+
+        self._warn_if_empty_extraction(document, "uploaded")
 
     def perform_update(self, serializer):
         self._validate_course(serializer)
         self._validate_file(serializer)
         replacing_file = "file" in serializer.validated_data
         document = serializer.save()
+
         if replacing_file:
             text, pages = extract_text_and_pages(document.file)
             document.content_text = text
             document.content_pages = pages
             document.save(update_fields=["content_text", "content_pages"])
+
+            self._warn_if_empty_extraction(document, "re-uploaded")
 
 
 # =============================================================================
@@ -1049,8 +1146,6 @@ class LecturerDashboardView(APIView):
         my_exams = Exam.objects.filter(course__lecturer__user=user)
         my_rubrics = Rubric.objects.filter(created_by=user)
 
-        # Match submissions by course lecturer OR rubric author, so any
-        # legacy course-less submissions still surface to their rubric author.
         to_review = (
             ResearchSubmission.objects
             .filter(
@@ -1672,9 +1767,6 @@ class RubricViewSet(viewsets.ModelViewSet):
             return [permissions.IsAuthenticated()]
         return [permissions.IsAuthenticated(), IsLecturerOrAdmin()]
 
-    # ← FIXED: rubrics are now always tied to a course (enforced at the
-    # serializer level). Students see only rubrics for courses they're
-    # enrolled in — legacy course-less rubrics are hidden automatically.
     def get_queryset(self):
         user = self.request.user
         if is_admin(user):
@@ -1879,7 +1971,6 @@ class ResearchSubmissionViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK,
         )
 
-    # ─── NEW: revert an approval ─────────────────────────────────────
     @action(detail=True, methods=["post"], url_path="unapprove")
     def unapprove(self, request, pk=None):
         """
@@ -1929,7 +2020,6 @@ class ResearchSubmissionViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK,
         )
 
-    # ─── NEW: update lecturer comments only ──────────────────────────
     @action(detail=True, methods=["post"], url_path="comments")
     def comments(self, request, pk=None):
         """
@@ -2326,11 +2416,18 @@ class ExamAttemptViewSet(viewsets.ModelViewSet):
         if not is_admin(request.user):
             attempts = attempts.filter(student__user=request.user)
 
+        # Phase 1: lock, mark SUBMITTED, grade MCQs. Release lock.
         with transaction.atomic():
             attempt = get_object_or_404(
                 attempts.select_for_update(of=("self",)), pk=pk
             )
-            return _perform_exam_submit(request, attempt)
+            prepare_result = _perform_exam_submit_prepare(attempt)
+
+        if isinstance(prepare_result, Response):
+            return prepare_result
+
+        # Phase 2: dispatch AI grading outside the transaction.
+        return _perform_exam_submit_grade(request, prepare_result)
 
 
 # =============================================================================
