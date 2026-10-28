@@ -4,13 +4,18 @@ Django settings for the campusOs project.
 All deployment-specific values and secrets come from environment variables
 (loaded from .env by python-decouple in local dev, from the platform's env
 store in production). Nothing sensitive is committed.
+
+Redis layout (one server, separate logical databases):
+    db 0  Celery broker      db 1  Celery results      db 2  Django cache
+The cache backs DRF throttling, the grading lock, the in-flight dedupe keys and
+the AI result cache, so it must be a shared Redis (not per-process locmem).
 """
 import os
+import urllib.parse  # <-- ADDED for bulletproof DB parsing
 from datetime import timedelta
 from pathlib import Path
 
 import cloudinary
-import dj_database_url
 from celery.schedules import crontab
 from corsheaders.defaults import default_headers
 from decouple import config
@@ -203,20 +208,31 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "campusOs.wsgi.application"
 
-# ─── Database (Bulletproof for Neon/Render) ──────────────────────────
-# Fetch the exact string from the environment first, then explicitly 
-# parse it. This bypasses dj_database_url's fallback bugs.
+# ─── Database (Bulletproof Manual Parse for Neon/Render) ─────────────
 DATABASE_URL = config(
     "DATABASE_URL", 
     default="postgres://postgres:postgres@localhost:5432/campusos"
 )
 
+# Neon provides 'postgres://', but Django requires 'postgresql://'
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+url = urllib.parse.urlparse(DATABASE_URL)
+
 DATABASES = {
-    "default": dj_database_url.parse(
-        DATABASE_URL,
-        conn_max_age=60,
-        conn_health_checks=True,
-    )
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": url.path[1:],
+        "USER": url.username,
+        "PASSWORD": url.password,
+        "HOST": url.hostname,
+        "PORT": url.port or 5432,
+        "OPTIONS": {
+            # Neon requires SSL to connect
+            "sslmode": "require",
+        }
+    }
 }
 
 # ─── Password Validation ─────────────────────────────────────────────
