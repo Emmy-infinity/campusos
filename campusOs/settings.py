@@ -4,11 +4,6 @@ Django settings for the campusOs project.
 All deployment-specific values and secrets come from environment variables
 (loaded from .env by python-decouple in local dev, from the platform's env
 store in production). Nothing sensitive is committed.
-
-Redis layout (one server, separate logical databases):
-    db 0  Celery broker      db 1  Celery results      db 2  Django cache
-The cache backs DRF throttling, the grading lock, the in-flight dedupe keys and
-the AI result cache, so it must be a shared Redis (not per-process locmem).
 """
 import os
 import urllib.parse
@@ -219,6 +214,7 @@ DATABASE_URL = config(
     default="postgres://postgres:postgres@localhost:5432/campusos"
 )
 
+# Neon provides 'postgres://', but Django requires 'postgresql://'
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -233,7 +229,7 @@ DATABASES = {
         "HOST": url.hostname,
         "PORT": url.port or 5432,
         "OPTIONS": {
-            "sslmode": "require",
+            "sslmode": "require", # Neon requires SSL
         }
     }
 }
@@ -266,12 +262,14 @@ STORAGES = {
         "BACKEND": (
             "django.contrib.staticfiles.storage.StaticFilesStorage"
             if DEBUG
-            else "whitenoise.storage.CompressedManifestStaticFilesStorage"
+            # Use CompressedStaticFilesStorage (without Manifest) to avoid 500 errors on Render
+            else "whitenoise.storage.CompressedStaticFilesStorage" 
         ),
     },
 }
 
-WHITENOISE_USE_FINDERS = DEBUG
+# Set USE_FINDERS to True so Whitenoise looks inside apps (like unfold and DRF)
+WHITENOISE_USE_FINDERS = True
 WHITENOISE_AUTOREFRESH = DEBUG
 WHITENOISE_MAX_AGE = 0 if DEBUG else 31536000
 
@@ -303,7 +301,6 @@ BASE_URL = config("BASE_URL", default="http://localhost:8000")
 # ─── Redis helper ────────────────────────────────────────────────────
 def redis_url(db):
     return f"{REDIS_URL}/{db}"
-
 
 # ─── Caching ─────────────────────────────────────────────────────────
 CACHES = {
