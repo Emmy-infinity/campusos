@@ -11,7 +11,7 @@ The cache backs DRF throttling, the grading lock, the in-flight dedupe keys and
 the AI result cache, so it must be a shared Redis (not per-process locmem).
 """
 import os
-import urllib.parse  # <-- ADDED for bulletproof DB parsing
+import urllib.parse
 from datetime import timedelta
 from pathlib import Path
 
@@ -58,10 +58,9 @@ if RENDER_EXTERNAL_HOSTNAME:
     ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
 
 # ─── CORS & CSRF ─────────────────────────────────────────────────────
-FRONTEND_URL = config(
-    "FRONTEND_URL",
-    default=f"https://{NGROK_HOST}" if NGROK_HOST else "http://localhost:5173",
-)
+FRONTEND_URL = config("FRONTEND_URL", default="").strip()
+if not FRONTEND_URL:
+    FRONTEND_URL = f"https://{NGROK_HOST}" if NGROK_HOST else "http://localhost:5173"
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
@@ -76,6 +75,9 @@ CORS_ALLOWED_ORIGINS = [
 
 if NGROK_HOST:
     CORS_ALLOWED_ORIGINS.append(f"https://{NGROK_HOST}")
+
+# Filter out any empty strings that cause corsheaders.E013
+CORS_ALLOWED_ORIGINS = [url for url in CORS_ALLOWED_ORIGINS if url and url.strip()]
 
 CORS_ALLOWED_ORIGIN_REGEXES = [
     r"^https://.*\.onrender\.com$",
@@ -111,6 +113,9 @@ if NGROK_HOST:
 
 if RENDER_EXTERNAL_HOSTNAME:
     CSRF_TRUSTED_ORIGINS.append(f"https://{RENDER_EXTERNAL_HOSTNAME}")
+
+# Filter out any empty strings
+CSRF_TRUSTED_ORIGINS = [url for url in CSRF_TRUSTED_ORIGINS if url and url.strip()]
 
 # ─── Production Security (only when DEBUG=False) ─────────────────────
 if not DEBUG:
@@ -214,7 +219,6 @@ DATABASE_URL = config(
     default="postgres://postgres:postgres@localhost:5432/campusos"
 )
 
-# Neon provides 'postgres://', but Django requires 'postgresql://'
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -229,7 +233,6 @@ DATABASES = {
         "HOST": url.hostname,
         "PORT": url.port or 5432,
         "OPTIONS": {
-            # Neon requires SSL to connect
             "sslmode": "require",
         }
     }
