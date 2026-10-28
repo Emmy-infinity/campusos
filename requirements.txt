@@ -1,4 +1,5 @@
 asgiref
+python-decouple
 Django==5.1.8
 django-filter>=24.0,<25.0
 django-cors-headers
