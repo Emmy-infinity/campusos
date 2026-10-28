@@ -21,14 +21,23 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DEBUG = config("DEBUG", default=False, cast=bool)
 CELERY_TASK_ALWAYS_EAGER = config("CELERY_TASK_ALWAYS_EAGER", default=False, cast=bool)
 AI_FALLBACK_TO_EAGER = config("AI_FALLBACK_TO_EAGER", default=False, cast=bool)
-REDIS_URL = config("REDIS_URL", default="redis://127.0.0.1:6379").rstrip("/")
+
+# ─── Redis helper (Bulletproof) ──────────────────────────────────────
+REDIS_URL = config("REDIS_URL", default="").rstrip("/")
+
+# If we are in production (Render) and Redis points to localhost, 
+# it will fail. We strip it out so it falls back to Local Memory.
+if not DEBUG and ("127.0.0.1" in REDIS_URL or "localhost" in REDIS_URL):
+    REDIS_URL = ""
+
+def redis_url(db):
+    return f"{REDIS_URL}/{db}"
 # ═════════════════════════════════════════════════════════════════════════
 
 # ─── Tunnel / public host ────────────────────────────────────────────
 NGROK_HOST = config("NGROK_HOST", default="")
 
 # ─── Security ────────────────────────────────────────────────────────
-# No default — the app fails fast if SECRET_KEY is missing.
 SECRET_KEY = config("SECRET_KEY")
 
 ALLOWED_HOSTS = [
@@ -47,7 +56,6 @@ ALLOWED_HOSTS = [
 if NGROK_HOST:
     ALLOWED_HOSTS.append(NGROK_HOST)
 
-# Render sets this automatically; appending it makes the deploy just work.
 RENDER_EXTERNAL_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 if RENDER_EXTERNAL_HOSTNAME:
     ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
@@ -71,7 +79,6 @@ CORS_ALLOWED_ORIGINS = [
 if NGROK_HOST:
     CORS_ALLOWED_ORIGINS.append(f"https://{NGROK_HOST}")
 
-# Filter out any empty strings that cause corsheaders.E013
 CORS_ALLOWED_ORIGINS = [url for url in CORS_ALLOWED_ORIGINS if url and url.strip()]
 
 CORS_ALLOWED_ORIGIN_REGEXES = [
@@ -109,7 +116,6 @@ if NGROK_HOST:
 if RENDER_EXTERNAL_HOSTNAME:
     CSRF_TRUSTED_ORIGINS.append(f"https://{RENDER_EXTERNAL_HOSTNAME}")
 
-# Filter out any empty strings
 CSRF_TRUSTED_ORIGINS = [url for url in CSRF_TRUSTED_ORIGINS if url and url.strip()]
 
 # ─── Production Security (only when DEBUG=False) ─────────────────────
@@ -214,7 +220,6 @@ DATABASE_URL = config(
     default="postgres://postgres:postgres@localhost:5432/campusos"
 )
 
-# Neon provides 'postgres://', but Django requires 'postgresql://'
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -259,18 +264,12 @@ STORAGES = {
         "BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage",
     },
     "staticfiles": {
-        # FIX: Switched to standard storage. Whitenoise's compression
-        # engine crashes on duplicate files (e.g., unfold vs admin).
-        # This prevents the FileNotFoundError during collectstatic.
         "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
     },
 }
 
-# ─── CRITICAL FIX FOR DJANGO 5.1 + CLOUDINARY_STORAGE ────────────────
-# The cloudinary_storage package still looks for this deprecated setting.
 STATICFILES_STORAGE = "django.contrib.staticfiles.storage.StaticFilesStorage"
 
-# Set USE_FINDERS to True so Whitenoise looks inside apps (like unfold and DRF)
 WHITENOISE_USE_FINDERS = True
 WHITENOISE_AUTOREFRESH = DEBUG
 WHITENOISE_MAX_AGE = 0 if DEBUG else 31536000
@@ -300,27 +299,36 @@ FLW_SECRET_HASH = config("FLW_SECRET_HASH", default="")
 # ─── Absolute backend URL ────────────────────────────────────────────
 BASE_URL = config("BASE_URL", default="http://localhost:8000")
 
-# ─── Redis helper ────────────────────────────────────────────────────
-def redis_url(db):
-    return f"{REDIS_URL}/{db}"
-
 # ─── Caching ─────────────────────────────────────────────────────────
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.redis.RedisCache",
-        "LOCATION": redis_url(2),
-        "KEY_PREFIX": "campusos",
-        "TIMEOUT": 3600,
-        "OPTIONS": {
-            "socket_connect_timeout": 2,
-            "socket_timeout": 2,
-        },
+if REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": redis_url(2),
+            "KEY_PREFIX": "campusos",
+            "TIMEOUT": 3600,
+            "OPTIONS": {
+                "socket_connect_timeout": 2,
+                "socket_timeout": 2,
+            },
+        }
     }
-}
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "campusos-locmem",
+        }
+    }
 
 # ─── Celery ──────────────────────────────────────────────────────────
-CELERY_BROKER_URL = redis_url(0)
-CELERY_RESULT_BACKEND = redis_url(1)
+if REDIS_URL:
+    CELERY_BROKER_URL = redis_url(0)
+    CELERY_RESULT_BACKEND = redis_url(1)
+else:
+    CELERY_BROKER_URL = "memory://"
+    CELERY_RESULT_BACKEND = "cache+memory://"
+
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_BROKER_TRANSPORT_OPTIONS = {
     "visibility_timeout": 3600,
@@ -368,7 +376,6 @@ AI_GRADING_MODEL = config("AI_GRADING_MODEL", default="deepseek/deepseek-v4-flas
 AI_REASONING = {"enabled": False}
 AI_EXTRA_BODY = {}
 
-# ── Tunables: admin can override each one in AIServiceConfig ─────────
 AI_HIGHLIGHT_MAX_TOKENS = config("AI_HIGHLIGHT_MAX_TOKENS", default=1500, cast=int)
 AI_GRADING_MAX_TOKENS = config("AI_GRADING_MAX_TOKENS", default=1000, cast=int)
 AI_RESEARCH_MAX_TOKENS = config("AI_RESEARCH_MAX_TOKENS", default=2000, cast=int)
@@ -376,27 +383,23 @@ AI_REPAIR_ATTEMPTS = config("AI_REPAIR_ATTEMPTS", default=1, cast=int)
 AI_TEMPERATURE = config("AI_TEMPERATURE", default=0.0, cast=float)
 AI_MAX_ANSWER_CHARS = config("AI_MAX_ANSWER_CHARS", default=10000, cast=int)
 
-# ── Hard limits: env only, not exposed to admin ──────────────────────
 AI_MAX_INPUT_CHARS = config("AI_MAX_INPUT_CHARS", default=30000, cast=int)
 AI_MAX_TOKENS_CAP = config("AI_MAX_TOKENS_CAP", default=4000, cast=int)
 AI_CACHE_TTL = config("AI_CACHE_TTL", default=7 * 24 * 3600, cast=int)
 AI_CONFIG_TTL = config("AI_CONFIG_TTL", default=30, cast=int)
 AI_GRADING_WORKERS = config("AI_GRADING_WORKERS", default=4, cast=int)
 
-# ── Payment simulation (defaults to DEBUG; set explicitly in .env) ──
 AI_SIMULATE_PAYMENTS = config("AI_SIMULATE_PAYMENTS", default=DEBUG, cast=bool)
 
 EXAM_SUBMIT_GRACE_SECONDS = 60
 EXAM_MAX_ANSWER_CHARS = 10000
 EXAM_REVEAL_ANSWERS_AFTER_GRADING = False
 
-# ─── Correction Report Branding (env-driven) ─────────────────────────
 CORRECTION_UNIV_NAME = config("CORRECTION_UNIV_NAME", default="Gulu University")
 CORRECTION_DEPT_NAME = config("CORRECTION_DEPT_NAME", default="Department of Geography")
 CORRECTION_BRAND_COLOR = config("CORRECTION_BRAND_COLOR", default="#0d47a1")
 CORRECTION_LOGO_PATH = config("CORRECTION_LOGO_PATH", default="")
 
-# ─── Document Upload Settings ────────────────────────────────────────
 DOCUMENT_ALLOWED_EXTENSIONS = {
     ".pdf",
     ".docx", ".doc",
@@ -418,7 +421,6 @@ DATA_UPLOAD_MAX_NUMBER_FILES = 100
 AUTH_USER_MODEL = "campusos.User"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-# ─── Logging ─────────────────────────────────────────────────────────
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -446,7 +448,6 @@ LOGGING = {
     },
 }
 
-# ─── Pesapal (env-driven) ────────────────────────────────────────────
 PESAPAL_CONSUMER_KEY = config("PESAPAL_CONSUMER_KEY", default="")
 PESAPAL_CONSUMER_SECRET = config("PESAPAL_CONSUMER_SECRET", default="")
 PESAPAL_ENV = config("PESAPAL_ENV", default="sandbox")
