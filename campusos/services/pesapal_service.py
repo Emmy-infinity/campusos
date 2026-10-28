@@ -31,6 +31,21 @@ def _base_url() -> str:
     return settings.PESAPAL_BASE_URL.rstrip("/")
 
 
+def _safe_json(resp: requests.Response) -> dict:
+    """
+    Safely parse JSON. If Pesapal returns an HTML error page (e.g., 500 or 404),
+    this catches the JSONDecodeError and raises a clean PesapalError.
+    """
+    try:
+        return resp.json()
+    except ValueError:
+        # Truncate the HTML response to avoid gigantic error logs
+        snippet = resp.text[:300].replace("\n", " ")
+        raise PesapalError(
+            f"Pesapal returned an invalid response (HTTP {resp.status_code}): {snippet}"
+        )
+
+
 def get_access_token(force_refresh: bool = False) -> str:
     """Return a valid Pesapal bearer token, cached until just before expiry."""
     global _cached_token, _cached_token_expiry
@@ -51,7 +66,7 @@ def get_access_token(force_refresh: bool = False) -> str:
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=15)
             resp.raise_for_status()
-            data = resp.json()
+            data = _safe_json(resp)
         except requests.RequestException as exc:
             logger.exception("Pesapal auth failed: %s", exc)
             raise PesapalError(f"Could not authenticate with Pesapal: {exc}")
@@ -83,7 +98,7 @@ def register_ipn_url(ipn_url: str) -> str:
         resp = requests.post(url, json=payload, headers=_auth_headers(),
                              timeout=15)
         resp.raise_for_status()
-        data = resp.json()
+        data = _safe_json(resp)
     except requests.RequestException as exc:
         logger.exception("Pesapal IPN registration failed: %s", exc)
         raise PesapalError(f"Could not register IPN: {exc}")
@@ -100,7 +115,7 @@ def list_registered_ipns() -> list:
     try:
         resp = requests.get(url, headers=_auth_headers(), timeout=15)
         resp.raise_for_status()
-        return resp.json()
+        return _safe_json(resp)
     except requests.RequestException as exc:
         raise PesapalError(f"Could not list IPNs: {exc}")
 
@@ -127,13 +142,17 @@ def submit_order(*, merchant_reference, amount, currency, description,
         resp = requests.post(url, json=payload, headers=_auth_headers(),
                              timeout=20)
         resp.raise_for_status()
-        data = resp.json()
+        data = _safe_json(resp)
     except requests.RequestException as exc:
         logger.exception("Pesapal submit_order failed: %s", exc)
         raise PesapalError(f"Could not submit order: {exc}")
 
     if data.get("error"):
-        raise PesapalError(f"Pesapal rejected order: {data['error']}")
+        # Pesapal usually returns error as a dict with 'message' or 'code'
+        err = data['error']
+        err_msg = err.get('message', str(err)) if isinstance(err, dict) else str(err)
+        raise PesapalError(f"Pesapal rejected order: {err_msg}")
+        
     return data
 
 
@@ -145,6 +164,6 @@ def get_transaction_status(order_tracking_id: str) -> dict:
         resp = requests.get(url, params=params, headers=_auth_headers(),
                             timeout=15)
         resp.raise_for_status()
-        return resp.json()
+        return _safe_json(resp)
     except requests.RequestException as exc:
         raise PesapalError(f"Could not query status: {exc}")
