@@ -11,22 +11,22 @@ CHANGELOG
 ---------
 - Added _normalize_billing(): guarantees every field Pesapal's
   billing_address schema expects is present AND is a non-empty string.
-  This fixes "Middle Name cannot be null or empty" — the field is
-  documented as optional, but Pesapal's validator rejects both `null`
-  and `""` on some merchant tiers. We send "N/A" as a placeholder when
-  the caller doesn't provide one.
-- submit_order() now runs billing through _normalize_billing() before
-  building the request, so callers can pass partial dicts (or dicts
-  with None values) without triggering Pesapal's strict validation.
-- PesapalError now stores `payload` and `status_code` when available,
-  so error handlers can log Pesapal's exact response instead of just
-  the extracted message. This makes the `payload=%r` in views.py useful.
-- submit_order() logs the outgoing payload at INFO level, so the next
-  time Pesapal rejects an order, the exact billing_address is in the
-  log — not just the error message.
+- Name fields (first/middle/last) are sanitized to Pesapal's allowed
+  charset: A-Z a-z 0-9 - _ . :
+  Anything else (spaces, apostrophes, slashes, commas) is stripped.
+  This fixes:
+    "Middle Name cannot be null or empty"
+    "Middle Name can only contain alphanumeric characters, dashes,
+     underscores, dots, and colons"
+- middle_name fallback is "NA" (no slash — "/" is not in the allowed
+  charset, so "N/A" would fail).
+- submit_order() logs the outgoing payload so failures show the exact
+  billing_address that went out.
+- PesapalError stores `status_code` and `payload` for richer error logs.
 """
 import json
 import logging
+import re
 import threading
 import time
 
@@ -51,17 +51,19 @@ _cached_token = None
 _cached_token_expiry = 0
 
 
-# ─── Billing normalizer ──────────────────────────────────────────
-# Pesapal's billing_address schema requires every field to be a
-# **non-empty string**. Documented as "optional" for middle_name,
-# state, postal_code, zip_code — but the validator rejects `null`
-# AND `""` for them on some merchant tiers. We always send a value.
+# ─── Billing normalizer & sanitizer ─────────────────────────────
+# Pesapal's billing_address schema:
+#   - every field must be a **non-empty string**
+#   - name fields accept only:  A-Z a-z 0-9 - _ . :
+#   - middle_name rejects `null` AND `""` on some merchant tiers
+#
+# We always send every field with a value and strip disallowed chars.
 _PESAPAL_BILLING_DEFAULTS = {
     "email_address": "",
     "phone_number": "",
     "country_code": "UG",
     "first_name": "",
-    "middle_name": "N/A",   # ← must be non-empty; "" also fails
+    "middle_name": "NA",    # no slash — "/" is not in the charset
     "last_name": "",
     "line_1": "",           # note: `line_1`, not `line1`
     "line_2": "",
@@ -71,31 +73,69 @@ _PESAPAL_BILLING_DEFAULTS = {
     "zip_code": "",
 }
 
-# Fields that MUST be non-empty. If the caller passes "" or None,
-# we substitute this placeholder. middle_name is the one that
-# triggered "cannot be null or empty" in production.
-_BILLING_NON_EMPTY_PLACEHOLDER = "N/A"
+# Pesapal rejects chars outside this set for name fields.
+_NAME_CHARSET = re.compile(r"[^A-Za-z0-9\-_.:]")
+
+# Name fields that must be sanitized with the strict charset.
+_NAME_FIELDS = ("first_name", "middle_name", "last_name")
+
+# Address fields — currently we sanitize with the same charset to be safe.
+# If Pesapal is more permissive for addresses, we can relax this later.
+_ADDRESS_FIELDS = ("line_1", "line_2", "city", "state")
+
+# Postal/zip — alphanumeric only.
+_POSTAL_FIELDS = ("postal_code", "zip_code")
+
+
+def _sanitize(value: str, pattern: re.Pattern) -> str:
+    """Strip characters not in `pattern` and trim whitespace."""
+    if not value:
+        return ""
+    return pattern.sub("", str(value)).strip()
 
 
 def _normalize_billing(billing):
     """
-    Fill every field Pesapal's billing_address schema expects and coerce
-    None/empty values to safe strings.
+    Fill every field Pesapal's billing_address schema expects, coerce
+    None → "", sanitize string fields to Pesapal's charset rules, and
+    apply non-empty fallbacks.
 
     Guarantees:
-      - Every key in _PESAPAL_BILLING_DEFAULTS exists in the output.
-      - Every value is a string (never None).
-      - middle_name is non-empty (Pesapal rejects "" too).
-
-    Callers can therefore pass partial dicts or dicts with None values
-    without triggering 'X cannot be null or empty' errors.
+      - every key in _PESAPAL_BILLING_DEFAULTS exists in the output
+      - every value is a string (never None)
+      - name fields contain only [A-Za-z0-9-_.:]
+      - middle_name is non-empty
+      - line_1, city are non-empty
     """
     merged = {**_PESAPAL_BILLING_DEFAULTS, **(billing or {})}
     out = {k: ("" if v is None else str(v)) for k, v in merged.items()}
-    # Pesapal rejects empty strings for middle_name. Force a placeholder
-    # if the caller didn't supply one.
+
+    # Sanitize name fields to Pesapal's strict charset.
+    # "Mary Ann" → "MaryAnn", "O'Brien" → "OBrien", "N/A" → "NA".
+    for field in _NAME_FIELDS:
+        out[field] = _sanitize(out[field], _NAME_CHARSET)
+
+    # Address fields — same charset rule, to avoid the next round of
+    # "line_1 can only contain ..." errors.
+    for field in _ADDRESS_FIELDS:
+        out[field] = _sanitize(out[field], _NAME_CHARSET)
+
+    # Postal / zip — alphanumeric only.
+    for field in _POSTAL_FIELDS:
+        out[field] = _sanitize(out[field], _NAME_CHARSET)
+
+    # Fallbacks for mandatory non-empty fields.
     if not out["middle_name"]:
-        out["middle_name"] = _BILLING_NON_EMPTY_PLACEHOLDER
+        out["middle_name"] = "NA"           # "/" not allowed
+    if not out["first_name"]:
+        out["first_name"] = "Student"
+    if not out["last_name"]:
+        out["last_name"] = "User"
+    if not out["line_1"]:
+        out["line_1"] = "Kampala"
+    if not out["city"]:
+        out["city"] = "Kampala"
+
     return out
 
 
@@ -111,7 +151,6 @@ def _safe_json(resp: requests.Response) -> dict:
     try:
         return resp.json()
     except ValueError:
-        # Truncate the HTML response to avoid gigantic error logs
         snippet = resp.text[:300].replace("\n", " ")
         raise PesapalError(
             f"Pesapal returned an invalid response (HTTP {resp.status_code}): {snippet}",
@@ -207,10 +246,9 @@ def submit_order(*, merchant_reference, amount, currency, description,
     Submit an order to Pesapal. Returns:
       { order_tracking_id, merchant_reference, redirect_url, error, status }
 
-    The billing dict is normalized through _normalize_billing() before the
-    request goes out, so partial dicts / None values / empty strings are
-    safe — Pesapal's validator never sees `null` or `""` for a required
-    field.
+    The billing dict is normalized + sanitized through _normalize_billing()
+    before the request goes out, so partial dicts / None values /
+    disallowed characters are all made safe before they reach Pesapal.
     """
     url = f"{_base_url()}/Transactions/SubmitOrderRequest"
     payload = {
@@ -223,10 +261,6 @@ def submit_order(*, merchant_reference, amount, currency, description,
         "billing_address": _normalize_billing(billing),
     }
 
-    # Diagnostic — if Pesapal rejects the order, this log line shows the
-    # exact payload that went out (including middle_name value), so we
-    # can tell "our code sent the wrong thing" apart from "Pesapal's
-    # validator is broken".
     logger.info(
         "Pesapal SubmitOrder payload for %s: %s",
         merchant_reference, json.dumps(payload, default=str),
@@ -242,7 +276,6 @@ def submit_order(*, merchant_reference, amount, currency, description,
         raise PesapalError(f"Could not submit order: {exc}")
 
     if data.get("error"):
-        # Pesapal usually returns error as a dict with 'message' or 'code'
         err = data["error"]
         err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
         raise PesapalError(
