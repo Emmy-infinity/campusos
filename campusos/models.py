@@ -61,6 +61,9 @@ CHANGELOG
 - CorrectionReport: new model. One row per generated branded correction PDF.
 - StudentProfile / LecturerProfile: added `avatar` (ImageField, nullable,
   blank).
+- PaymentTransaction.amount_cents: help_text corrected. The field stores
+  the smallest unit of the transaction currency. For UGX (which has no
+  minor unit) that is 1:1 — 5000 = UGX 5,000. For USD/KES/EUR it is cents.
 """
 
 
@@ -962,8 +965,6 @@ class UserAIUsage(models.Model):
     )
     feature = models.CharField(max_length=50, db_index=True)
     tokens_used = models.PositiveIntegerField()
-    # DecimalField so fractional token_cost_cents values don't truncate to
-    # zero. Existing integer values convert cleanly (X → X.000000).
     cost_cents = models.DecimalField(
         max_digits=10, decimal_places=6, default=Decimal("0"),
     )
@@ -1016,8 +1017,18 @@ class PaymentTransaction(models.Model):
         on_delete=models.PROTECT,
         related_name='payments',
     )
+    # ── CHANGED: help_text clarified ──────────────────────────
+    # The field stores the smallest unit of the transaction currency.
+    # For UGX (which has no minor unit) that is 1:1 — 5000 = UGX 5,000.
+    # For USD/KES/EUR (which have cents) that is 5000 = 50.00.
+    # The view PurchaseTokensView passes this value straight to Pesapal
+    # as `amount` for UGX, so the semantic must match reality.
     amount_cents = models.PositiveIntegerField(
-        help_text="Amount charged, in minor units (cents). e.g. 5000 = UGX 50.00.",
+        help_text=(
+            "Amount charged, in the smallest unit of the transaction currency. "
+            "For UGX (no minor unit), 5000 = UGX 5,000. "
+            "For USD/KES/EUR (which have cents), 5000 = 50.00."
+        ),
     )
     tokens_purchased = models.PositiveIntegerField()
     status = models.CharField(
