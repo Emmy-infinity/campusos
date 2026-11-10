@@ -628,7 +628,7 @@ class PurchaseTokensView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            # ── FIXED: Decimal-safe token calculation ──────────
+            # ── Decimal-safe token calculation ──────────────────
             token_cost = config.token_cost_cents or Decimal("0")
             if token_cost <= 0:
                 logger.error(
@@ -656,20 +656,54 @@ class PurchaseTokensView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        # ── Billing info from the student ──────────────────────
+        # ── Billing info (PESAPAL FIX) ─────────────────────────
+        # Every value MUST be a string. Pesapal rejects `null` with:
+        #   "Middle Name cannot be null or empty"
+        # Field names are snake_case: `line_1`, not `line1`.
+        # We accept both `line_1` and `line1` from the client for
+        # backwards compatibility.
+        full_name = (request.user.get_full_name() or "").strip()
+        name_parts = full_name.split(" ", 1) if full_name else []
+        first_from_name = name_parts[0] if name_parts else ""
+        last_from_name = name_parts[1] if len(name_parts) > 1 else ""
+
         billing = {
             "email_address": request.user.email or "noemail@campusos.local",
-            "phone_number": request.data.get("phone_number") or "0700000000",
-            "country_code": request.data.get("country_code") or "UG",
-            "first_name": request.user.first_name or request.user.username,
-            "last_name": request.user.last_name or "User",
-            "line1": request.data.get("line1") or "Kampala",
+            "phone_number": str(
+                request.data.get("phone_number") or "0700000000"
+            ),
+            "country_code": str(
+                request.data.get("country_code") or "UG"
+            ).upper(),
+            "first_name": (
+                (request.user.first_name or first_from_name).strip()
+                or request.user.username
+                or "Student"
+            ),
+            "middle_name": str(request.data.get("middle_name") or ""),
+            "last_name": (
+                (request.user.last_name or last_from_name).strip()
+                or "User"
+            ),
+            "line_1": str(
+                request.data.get("line_1")
+                or request.data.get("line1")
+                or "Kampala"
+            ),
+            "line_2": str(request.data.get("line_2") or ""),
+            "city": str(request.data.get("city") or "Kampala"),
+            "state": str(request.data.get("state") or ""),
+            "postal_code": str(request.data.get("postal_code") or ""),
+            "zip_code": str(request.data.get("zip_code") or ""),
         }
 
         # ── Create the PENDING transaction row ─────────────────
         reference = f"campusos-{uuid.uuid4().hex[:20]}"
-        
-        # ── FIXED: UGX has no cents. Do not divide by 100. ─────
+
+        # ── amount_cents is in the smallest unit of the currency.
+        #    For UGX (no minor unit) that is 1:1 — send as-is.
+        #    If you switch currency to one with cents (USD/KES/EUR),
+        #    change to `amount_cents / 100.0`.
         amount_major = float(amount_cents)
 
         payment = PaymentTransaction.objects.create(
@@ -686,14 +720,17 @@ class PurchaseTokensView(APIView):
             data = submit_order(
                 merchant_reference=reference,
                 amount=amount_major,
-                currency="UGX",  # change to KES/TZS as needed
+                currency="UGX",
                 description=f"{tokens} CampusOS AI tokens",
                 callback_url=settings.PESAPAL_CALLBACK_URL,
                 notification_id=settings.PESAPAL_IPN_ID,
                 billing=billing,
             )
         except PesapalError as exc:
-            logger.exception("Pesapal submit failed for %s", reference)
+            logger.exception(
+                "Pesapal submit failed for %s | payload=%r",
+                reference, getattr(exc, "payload", None),
+            )
             payment.mark_failed(reason=str(exc))
             return Response(
                 {"error": str(exc)},
@@ -923,12 +960,11 @@ class AIServiceConfigView(APIView):
             AIServiceConfig.load(), data=request.data, partial=True
         )
         serializer.is_valid(raise_exception=True)
-        
-        # ── FIXED: Track who made the change ──
+
         obj = serializer.save()
         obj.updated_by = request.user
         obj.save(update_fields=["updated_by"])
-        
+
         reset_config_cache()
         return Response(serializer.data)
 
@@ -1119,7 +1155,6 @@ class LecturerDashboardView(APIView):
             "published_exams": my_exams.filter(is_published=True).count(),
             "rubrics": my_rubrics.count(),
             "pending_submissions": to_review.count(),
-            # ── FIXED: Hide negative balance from UI ──
             "tokens_remaining": max(0, credit.remaining_tokens),
         }
 
@@ -1219,7 +1254,6 @@ class StudentDashboardView(APIView):
             "reviewed": my_submissions.filter(
                 evaluation_status=ResearchSubmission.Status.REVIEWED
             ).count(),
-            # ── FIXED: Hide negative balance from UI ──
             "tokens_remaining": max(0, credit.remaining_tokens),
             "exams_attempted": my_attempts.count(),
             "exams_graded": my_attempts.filter(
@@ -2025,7 +2059,6 @@ class ResearchSubmissionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ── FIXED: Reset status so the worker doesn't skip it ──
         submission.evaluation_status = ResearchSubmission.Status.PENDING
         submission.save(update_fields=["evaluation_status"])
 
