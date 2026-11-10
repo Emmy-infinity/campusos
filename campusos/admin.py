@@ -1,4 +1,5 @@
 # admin.py
+#refactored very well
 from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
@@ -85,8 +86,8 @@ class DocumentAdmin(ModelAdmin):
     autocomplete_fields = ('uploaded_by', 'course')
     readonly_fields = ('search_vector', 'content_pages', 'created_at', 'updated_at')
     date_hierarchy = 'created_at'
-    
-    save_on_top = True  # ← Keeps the Save button visible at the top
+
+    save_on_top = True
 
 
 @admin.register(Highlight)
@@ -118,8 +119,8 @@ class QuestionAdmin(ModelAdmin):
     search_fields = ('text', 'explanation', 'model_answer', 'bank__title')
     autocomplete_fields = ('bank',)
     readonly_fields = ('created_at', 'updated_at')
-    
-    save_on_top = True  # ← Keeps the Save button visible at the top
+
+    save_on_top = True
 
 
 class ExamQuestionInline(admin.TabularInline):
@@ -138,8 +139,8 @@ class ExamAdmin(ModelAdmin):
     readonly_fields = ('created_at', 'updated_at')
     date_hierarchy = 'start_time'
     inlines = (ExamQuestionInline,)
-    
-    save_on_top = True  # ← Keeps the Save button visible at the top
+
+    save_on_top = True
 
 
 @admin.register(ExamQuestion)
@@ -190,8 +191,8 @@ class RubricAdmin(ModelAdmin):
     search_fields = ('title', 'description', 'course__code')
     autocomplete_fields = ('course', 'created_by')
     readonly_fields = ('created_at', 'updated_at')
-    
-    save_on_top = True  # ← Keeps the Save button visible at the top
+
+    save_on_top = True
 
 
 @admin.register(ResearchSubmission)
@@ -206,8 +207,8 @@ class ResearchSubmissionAdmin(ModelAdmin):
     autocomplete_fields = ('student', 'course', 'document', 'rubric', 'approved_by')
     readonly_fields = ('submitted_at', 'approved_at', 'ai_feedback')
     date_hierarchy = 'submitted_at'
-    
-    save_on_top = True  # ← FIXED: The submission form now has buttons at the top
+
+    save_on_top = True
 
 
 @admin.register(RubricEvaluation)
@@ -241,14 +242,29 @@ class CorrectionReportAdmin(ModelAdmin):
 class AIServiceConfigAdmin(ModelAdmin):
     """
     Singleton admin for AI service configuration.
+
+    FIXES (see inline markers):
+      - changelist_view() ensures the singleton row exists before render,
+        so the page is always clickable even on a fresh DB.
+      - fieldsets use ONE field per line instead of the ("model_field",
+        "env_field") tuple syntax, which Unfold can silently drop when a
+        model field is paired with a readonly callable in the same tuple.
+      - explicit has_view_permission / has_change_permission so the form
+        is reachable by any staff user.
+      - list_display shows the effective model (override or "from env")
+        so you can confirm at a glance which model is in use.
     """
     list_display = (
         "ai_highlighting_enabled",
         "ai_marking_enabled",
         "ai_research_guidance_enabled",
         "token_cost_cents",
+        "highlight_model_display",
+        "grading_model_display",
+        "research_model_display",
         "updated_at",
     )
+    list_display_links = ("ai_highlighting_enabled",)
     readonly_fields = (
         "updated_at",
         "updated_by",
@@ -261,8 +277,9 @@ class AIServiceConfigAdmin(ModelAdmin):
         "env_repair_attempts",
         "env_temperature",
     )
-    
-    # The tuple syntax ("field", "env_field") creates a responsive 2-column grid.
+
+    # ← FIX: one field per line. The ("a", "b") tuple syntax was hiding
+    # the model fields when mixed with readonly callables in Unfold.
     fieldsets = (
         ("Feature toggles", {
             "fields": (
@@ -272,28 +289,59 @@ class AIServiceConfigAdmin(ModelAdmin):
             ),
             "description": "Users get a 403 with a clear message when a feature is disabled.",
         }),
-        ("Models (leave blank to inherit from .env)", {
+        ("Highlight model", {
             "fields": (
-                ("highlight_model", "env_highlight_model"),
-                ("grading_model", "env_grading_model"),
-                ("research_model", "env_research_model"),
+                "highlight_model",
+                "env_highlight_model",
             ),
-            "description": "Format: provider/model-name. The block on the right shows the inherited .env value.",
+            "description": (
+                "Format: provider/model-name (e.g. deepseek/deepseek-chat). "
+                "Leave blank to inherit from AI_DEFAULT_MODEL."
+            ),
         }),
-        ("Token budgets (leave blank to inherit from .env)", {
+        ("Highlight token budget", {
             "fields": (
-                ("highlight_max_tokens", "env_highlight_max_tokens"),
-                ("grading_max_tokens", "env_grading_max_tokens"),
-                ("research_max_tokens", "env_research_max_tokens"),
+                "highlight_max_tokens",
+                "env_highlight_max_tokens",
             ),
-            "description": "Caps the model's output length per request.",
+            "description": "Leave blank to inherit from AI_HIGHLIGHT_MAX_TOKENS.",
         }),
-        ("Reliability & sampling (leave blank to inherit from .env)", {
+        ("Grading model", {
             "fields": (
-                ("repair_attempts", "env_repair_attempts"),
-                ("temperature", "env_temperature"),
+                "grading_model",
+                "env_grading_model",
             ),
-            "description": "0 repair attempts disables repair. Temperature 0.0 is deterministic.",
+            "description": "Leave blank to inherit from AI_GRADING_MODEL.",
+        }),
+        ("Grading token budget", {
+            "fields": (
+                "grading_max_tokens",
+                "env_grading_max_tokens",
+            ),
+            "description": "Leave blank to inherit from AI_GRADING_MAX_TOKENS.",
+        }),
+        ("Research model", {
+            "fields": (
+                "research_model",
+                "env_research_model",
+            ),
+            "description": "Leave blank to inherit from AI_DEFAULT_MODEL.",
+        }),
+        ("Research token budget", {
+            "fields": (
+                "research_max_tokens",
+                "env_research_max_tokens",
+            ),
+            "description": "Leave blank to inherit from AI_RESEARCH_MAX_TOKENS.",
+        }),
+        ("Reliability & sampling", {
+            "fields": (
+                "repair_attempts",
+                "env_repair_attempts",
+                "temperature",
+                "env_temperature",
+            ),
+            "description": "Leave blank to inherit from .env. 0 repair attempts disables repair.",
         }),
         ("Pricing & allowance", {
             "fields": (
@@ -308,63 +356,88 @@ class AIServiceConfigAdmin(ModelAdmin):
             "classes": ("collapse",),
         }),
     )
-    
-    save_on_top = True  # ← Keeps the Save button visible at the top
 
-    # ── env display (readonly; renders as compact grey blocks) ──────
+    save_on_top = True
 
+    # ── changelist columns ────────────────────────────────────────
+    @admin.display(description="Highlight model")
+    def highlight_model_display(self, obj):
+        return obj.highlight_model or "— (from env)"
+
+    @admin.display(description="Grading model")
+    def grading_model_display(self, obj):
+        return obj.grading_model or "— (from env)"
+
+    @admin.display(description="Research model")
+    def research_model_display(self, obj):
+        return obj.research_model or "— (from env)"
+
+    # ── env display (readonly; renders as grey blocks) ────────────
     def _env_html(self, key, default="(unset)"):
         val = getattr(settings, key, default)
         return format_html(
-            '<div style="padding: 8px 12px; background-color: var(--unfold-bg-secondary, #f3f4f6); '
-            'border: 1px solid var(--unfold-border, #d1d5db); border-radius: 6px; '
-            'font-family: monospace; font-size: 0.85em; line-height: 1.4; '
+            '<div style="padding: 6px 10px; background-color: var(--unfold-bg-secondary, #f3f4f6); '
+            'border: 1px solid var(--unfold-border, #d1d5db); border-radius: 4px; '
+            'font-family: monospace; font-size: 0.85em; '
             'word-break: break-all; color: var(--unfold-text-secondary, #4b5563);">'
-            '<div style="font-weight: 600; margin-bottom: 4px;">{}</div>'
-            '<div>{}</div>'
+            'Inherited from <b>{}</b>: {}'
             '</div>',
             key, val
         )
 
-    @admin.display(description="")
+    @admin.display(description="Inherited value")
     def env_highlight_model(self, obj):
         return self._env_html("AI_DEFAULT_MODEL")
 
-    @admin.display(description="")
+    @admin.display(description="Inherited value")
     def env_grading_model(self, obj):
         return self._env_html("AI_GRADING_MODEL")
 
-    @admin.display(description="")
+    @admin.display(description="Inherited value")
     def env_research_model(self, obj):
         return self._env_html("AI_DEFAULT_MODEL")
 
-    @admin.display(description="")
+    @admin.display(description="Inherited value")
     def env_highlight_max_tokens(self, obj):
         return self._env_html("AI_HIGHLIGHT_MAX_TOKENS")
 
-    @admin.display(description="")
+    @admin.display(description="Inherited value")
     def env_grading_max_tokens(self, obj):
         return self._env_html("AI_GRADING_MAX_TOKENS")
 
-    @admin.display(description="")
+    @admin.display(description="Inherited value")
     def env_research_max_tokens(self, obj):
         return self._env_html("AI_RESEARCH_MAX_TOKENS")
 
-    @admin.display(description="")
+    @admin.display(description="Inherited value")
     def env_repair_attempts(self, obj):
         return self._env_html("AI_REPAIR_ATTEMPTS", 1)
 
-    @admin.display(description="")
+    @admin.display(description="Inherited value")
     def env_temperature(self, obj):
         return self._env_html("AI_TEMPERATURE", 0.0)
 
-    # ── singleton guards ─────────────────────────────────────────────
+    # ← FIX: ensure the singleton row exists when the changelist opens.
+    # Without this, an empty table + has_add_permission=False makes the
+    # page look unreachable in some Unfold versions.
+    def changelist_view(self, request, extra_context=None):
+        AIServiceConfig.load()
+        return super().changelist_view(request, extra_context)
 
+    # ── singleton guards ──────────────────────────────────────────
     def has_add_permission(self, request):
         return not AIServiceConfig.objects.exists()
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+    # ← FIX: explicit view/change permissions so the singleton is always
+    # reachable for staff users, regardless of default ModelAdmin rules.
+    def has_view_permission(self, request, obj=None):
+        return True
+
+    def has_change_permission(self, request, obj=None):
+        return True
 
     def save_model(self, request, obj, form, change):
         obj.updated_by = request.user
