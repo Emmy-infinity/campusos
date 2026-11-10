@@ -657,11 +657,11 @@ class PurchaseTokensView(APIView):
                 )
 
         # ── Billing info (PESAPAL FIX) ─────────────────────────
-        # Every value MUST be a string. Pesapal rejects `null` with:
+        # Every value MUST be a string. Pesapal rejects `null` AND `""` with:
         #   "Middle Name cannot be null or empty"
-        # Field names are snake_case: `line_1`, not `line1`.
-        # We accept both `line_1` and `line1` from the client for
-        # backwards compatibility.
+        # So we send a non-empty placeholder ("N/A") for middle_name when
+        # the user doesn't have one. Field names are snake_case: `line_1`,
+        # not `line1`. We accept both from the client for backwards compat.
         full_name = (request.user.get_full_name() or "").strip()
         name_parts = full_name.split(" ", 1) if full_name else []
         first_from_name = name_parts[0] if name_parts else ""
@@ -680,7 +680,10 @@ class PurchaseTokensView(APIView):
                 or request.user.username
                 or "Student"
             ),
-            "middle_name": str(request.data.get("middle_name") or ""),
+            # ← FIXED: "N/A" instead of "". Pesapal rejects "" with
+            #   "Middle Name cannot be null or empty". The message is
+            #   literal: the field must be non-empty.
+            "middle_name": str(request.data.get("middle_name") or "N/A"),
             "last_name": (
                 (request.user.last_name or last_from_name).strip()
                 or "User"
