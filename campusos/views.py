@@ -683,7 +683,7 @@ class PurchaseTokensView(APIView):
             # ← FIXED: "N/A" instead of "". Pesapal rejects "" with
             #   "Middle Name cannot be null or empty". The message is
             #   literal: the field must be non-empty.
-            "middle_name": str(request.data.get("middle_name") or "N/A"),
+            "middle_name": str(request.data.get("middle_name") or "NA"),
             "last_name": (
                 (request.user.last_name or last_from_name).strip()
                 or "User"
