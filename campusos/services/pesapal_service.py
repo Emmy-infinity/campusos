@@ -1,27 +1,29 @@
 """
 Pesapal API v3 client for CampusOS.
 
-Handles:
-  - OAuth token generation (cached; Pesapal tokens live 5 minutes)
-  - IPN URL registration (one-time setup per tunnel / deployment)
-  - Order submission (returns the redirect URL for the student)
-  - Transaction status queries (used to verify IPNs server-side)
-
 CHANGELOG
 ---------
 - Added _normalize_billing(): guarantees every field Pesapal's
-  billing_address schema expects is present AND is a non-empty string.
-- Name fields (first/middle/last) are sanitized to Pesapal's allowed
-  charset: A-Z a-z 0-9 - _ . :
-  Anything else (spaces, apostrophes, slashes, commas) is stripped.
-  This fixes:
-    "Middle Name cannot be null or empty"
-    "Middle Name can only contain alphanumeric characters, dashes,
-     underscores, dots, and colons"
-- middle_name fallback is "NA" (no slash — "/" is not in the allowed
-  charset, so "N/A" would fail).
+  billing_address schema expects is present, non-empty, and (for name
+  and address fields) restricted to Pesapal's allowed charset
+  [A-Za-z0-9-_.:].
+
+  Pesapal's validator on this merchant tier rejects `null` AND `""`
+  for EVERY field — including ones documented as optional. It checks
+  them in order and returns the first failure. So we now fill every
+  field with a non-empty placeholder:
+
+    middle_name  → "NA"
+    line_2       → "NA"
+    state        → "NA"
+    postal_code  → "00000"
+    zip_code     → "00000"
+
+- First/middle/last name and address fields are sanitized to strip
+  any char outside [A-Za-z0-9-_.:] — e.g. "O'Brien" → "OBrien",
+  "Mary Ann" → "MaryAnn", "N/A" → "NA".
 - submit_order() logs the outgoing payload so failures show the exact
-  billing_address that went out.
+  billing_address.
 - PesapalError stores `status_code` and `payload` for richer error logs.
 """
 import json
@@ -52,42 +54,35 @@ _cached_token_expiry = 0
 
 
 # ─── Billing normalizer & sanitizer ─────────────────────────────
-# Pesapal's billing_address schema:
-#   - every field must be a **non-empty string**
-#   - name fields accept only:  A-Z a-z 0-9 - _ . :
-#   - middle_name rejects `null` AND `""` on some merchant tiers
-#
-# We always send every field with a value and strip disallowed chars.
+# Pesapal's validator on this merchant tier requires EVERY billing
+# field to be a **non-empty string**, and name/address fields to
+# contain only [A-Za-z0-9-_.:]. We always send every field with a
+# non-empty value, sanitizing as needed.
 _PESAPAL_BILLING_DEFAULTS = {
     "email_address": "",
     "phone_number": "",
     "country_code": "UG",
-    "first_name": "",
-    "middle_name": "NA",    # no slash — "/" is not in the charset
-    "last_name": "",
-    "line_1": "",           # note: `line_1`, not `line1`
-    "line_2": "",
-    "city": "",
-    "state": "",
-    "postal_code": "",
-    "zip_code": "",
+    "first_name": "Student",
+    "middle_name": "NA",       # "/" not in allowed charset
+    "last_name": "User",
+    "line_1": "Kampala",
+    "line_2": "NA",            # was "" — Pesapal rejects empty
+    "city": "Kampala",
+    "state": "NA",             # was "" — Pesapal rejects empty
+    "postal_code": "00000",    # was "" — Pesapal rejects empty
+    "zip_code": "00000",       # was "" — Pesapal rejects empty
 }
 
-# Pesapal rejects chars outside this set for name fields.
+# Pesapal's allowed charset for name + address fields.
 _NAME_CHARSET = re.compile(r"[^A-Za-z0-9\-_.:]")
 
-# Name fields that must be sanitized with the strict charset.
+# Fields that get sanitized with the strict charset.
 _NAME_FIELDS = ("first_name", "middle_name", "last_name")
-
-# Address fields — currently we sanitize with the same charset to be safe.
-# If Pesapal is more permissive for addresses, we can relax this later.
 _ADDRESS_FIELDS = ("line_1", "line_2", "city", "state")
-
-# Postal/zip — alphanumeric only.
 _POSTAL_FIELDS = ("postal_code", "zip_code")
 
 
-def _sanitize(value: str, pattern: re.Pattern) -> str:
+def _sanitize(value, pattern):
     """Strip characters not in `pattern` and trim whitespace."""
     if not value:
         return ""
@@ -96,45 +91,55 @@ def _sanitize(value: str, pattern: re.Pattern) -> str:
 
 def _normalize_billing(billing):
     """
-    Fill every field Pesapal's billing_address schema expects, coerce
-    None → "", sanitize string fields to Pesapal's charset rules, and
-    apply non-empty fallbacks.
+    Fill every field Pesapal's billing_address schema expects, sanitize
+    to Pesapal's allowed charset, and apply non-empty fallbacks for
+    every field the validator checks.
 
     Guarantees:
       - every key in _PESAPAL_BILLING_DEFAULTS exists in the output
       - every value is a string (never None)
-      - name fields contain only [A-Za-z0-9-_.:]
-      - middle_name is non-empty
-      - line_1, city are non-empty
+      - every value is non-empty
+      - name + address fields contain only [A-Za-z0-9-_.:]
     """
     merged = {**_PESAPAL_BILLING_DEFAULTS, **(billing or {})}
     out = {k: ("" if v is None else str(v)) for k, v in merged.items()}
 
-    # Sanitize name fields to Pesapal's strict charset.
-    # "Mary Ann" → "MaryAnn", "O'Brien" → "OBrien", "N/A" → "NA".
+    # Sanitize name + address fields to Pesapal's charset.
+    # "O'Brien" → "OBrien", "Mary Ann" → "MaryAnn", "N/A" → "NA"
     for field in _NAME_FIELDS:
         out[field] = _sanitize(out[field], _NAME_CHARSET)
-
-    # Address fields — same charset rule, to avoid the next round of
-    # "line_1 can only contain ..." errors.
     for field in _ADDRESS_FIELDS:
         out[field] = _sanitize(out[field], _NAME_CHARSET)
-
-    # Postal / zip — alphanumeric only.
     for field in _POSTAL_FIELDS:
         out[field] = _sanitize(out[field], _NAME_CHARSET)
 
-    # Fallbacks for mandatory non-empty fields.
-    if not out["middle_name"]:
-        out["middle_name"] = "NA"           # "/" not allowed
+    # Fallbacks — Pesapal's validator rejects "" on this tier, so
+    # every empty field gets a placeholder. Keep this in sync with
+    # _PESAPAL_BILLING_DEFAULTS so a partial caller dict is still safe.
+    if not out["email_address"]:
+        out["email_address"] = "noemail@campusos.local"
+    if not out["phone_number"]:
+        out["phone_number"] = "0700000000"
+    if not out["country_code"]:
+        out["country_code"] = "UG"
     if not out["first_name"]:
         out["first_name"] = "Student"
+    if not out["middle_name"]:
+        out["middle_name"] = "NA"
     if not out["last_name"]:
         out["last_name"] = "User"
     if not out["line_1"]:
         out["line_1"] = "Kampala"
+    if not out["line_2"]:
+        out["line_2"] = "NA"
     if not out["city"]:
         out["city"] = "Kampala"
+    if not out["state"]:
+        out["state"] = "NA"
+    if not out["postal_code"]:
+        out["postal_code"] = "00000"
+    if not out["zip_code"]:
+        out["zip_code"] = "00000"
 
     return out
 
@@ -143,11 +148,7 @@ def _base_url() -> str:
     return settings.PESAPAL_BASE_URL.rstrip("/")
 
 
-def _safe_json(resp: requests.Response) -> dict:
-    """
-    Safely parse JSON. If Pesapal returns an HTML error page (e.g., 500 or 404),
-    this catches the JSONDecodeError and raises a clean PesapalError.
-    """
+def _safe_json(resp):
     try:
         return resp.json()
     except ValueError:
@@ -158,8 +159,7 @@ def _safe_json(resp: requests.Response) -> dict:
         )
 
 
-def get_access_token(force_refresh: bool = False) -> str:
-    """Return a valid Pesapal bearer token, cached until just before expiry."""
+def get_access_token(force_refresh=False):
     global _cached_token, _cached_token_expiry
 
     with _token_lock:
@@ -191,11 +191,11 @@ def get_access_token(force_refresh: bool = False) -> str:
             )
 
         _cached_token = token
-        _cached_token_expiry = now + 240  # safe margin under 5 min
+        _cached_token_expiry = now + 240
         return token
 
 
-def _auth_headers() -> dict:
+def _auth_headers():
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -203,15 +203,11 @@ def _auth_headers() -> dict:
     }
 
 
-# ─── IPN registration ────────────────────────────────────────────
-
-def register_ipn_url(ipn_url: str) -> str:
-    """Register (or re-register) our IPN URL. Returns the ipn_id."""
+def register_ipn_url(ipn_url):
     url = f"{_base_url()}/URLSetup/RegisterIPN"
     payload = {"url": ipn_url, "ipn_notification_type": "POST"}
     try:
-        resp = requests.post(url, json=payload, headers=_auth_headers(),
-                             timeout=15)
+        resp = requests.post(url, json=payload, headers=_auth_headers(), timeout=15)
         resp.raise_for_status()
         data = _safe_json(resp)
     except requests.RequestException as exc:
@@ -220,15 +216,12 @@ def register_ipn_url(ipn_url: str) -> str:
 
     ipn_id = data.get("ipn_id")
     if not ipn_id:
-        raise PesapalError(
-            f"No ipn_id in Pesapal response: {data}",
-            payload=data,
-        )
+        raise PesapalError(f"No ipn_id in Pesapal response: {data}", payload=data)
     logger.info("Pesapal IPN registered: %s (id=%s)", ipn_url, ipn_id)
     return ipn_id
 
 
-def list_registered_ipns() -> list:
+def list_registered_ipns():
     url = f"{_base_url()}/URLSetup/GetIpnList"
     try:
         resp = requests.get(url, headers=_auth_headers(), timeout=15)
@@ -238,18 +231,8 @@ def list_registered_ipns() -> list:
         raise PesapalError(f"Could not list IPNs: {exc}")
 
 
-# ─── Orders ──────────────────────────────────────────────────────
-
 def submit_order(*, merchant_reference, amount, currency, description,
-                 callback_url, notification_id, billing) -> dict:
-    """
-    Submit an order to Pesapal. Returns:
-      { order_tracking_id, merchant_reference, redirect_url, error, status }
-
-    The billing dict is normalized + sanitized through _normalize_billing()
-    before the request goes out, so partial dicts / None values /
-    disallowed characters are all made safe before they reach Pesapal.
-    """
+                 callback_url, notification_id, billing):
     url = f"{_base_url()}/Transactions/SubmitOrderRequest"
     payload = {
         "id": merchant_reference,
@@ -267,8 +250,7 @@ def submit_order(*, merchant_reference, amount, currency, description,
     )
 
     try:
-        resp = requests.post(url, json=payload, headers=_auth_headers(),
-                             timeout=20)
+        resp = requests.post(url, json=payload, headers=_auth_headers(), timeout=20)
         resp.raise_for_status()
         data = _safe_json(resp)
     except requests.RequestException as exc:
@@ -287,13 +269,11 @@ def submit_order(*, merchant_reference, amount, currency, description,
     return data
 
 
-def get_transaction_status(order_tracking_id: str) -> dict:
-    """Query Pesapal for a transaction's current status."""
+def get_transaction_status(order_tracking_id):
     url = f"{_base_url()}/Transactions/GetTransactionStatus"
     params = {"orderTrackingId": order_tracking_id}
     try:
-        resp = requests.get(url, params=params, headers=_auth_headers(),
-                            timeout=15)
+        resp = requests.get(url, params=params, headers=_auth_headers(), timeout=15)
         resp.raise_for_status()
         return _safe_json(resp)
     except requests.RequestException as exc:
