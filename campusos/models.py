@@ -1,2791 +1,1147 @@
-# views.py
+# models.py
 """
-API views for the academic platform. The AI work itself lives in
-ai_services.py and runs in Celery workers (tasks.py); these views validate,
-enqueue, and return 202 with a task_id.
+Academic platform data model.
 
-Route map is documented in campusos/urls.py.
+Domain overview
+----------------
+Users (students, lecturers, admins) belong to courses. Lecturers upload
+Documents (notes, question banks, research, etc.) scoped by visibility.
+Lecturers build QuestionBanks -> Questions, assemble them into Exams that
+students Attempt and Answer. Students can also submit research papers
+(ResearchSubmission) that get scored against a Rubric, producing one or more
+RubricEvaluation records over time.
+
+AI features (highlighting, marking, research guidance) are metered:
+- AIServiceConfig (singleton) holds admin-configurable cost/limit settings.
+  Every override field is nullable: NULL = "inherit from .env", value =
+  "admin has overridden". The resolve_*() helpers in ai_services.py
+  implement DB → env → hardcoded fallback.
+- UserAICredit stores each user's token balance (auto-created per user).
+  The balance may go negative after an exam-grading overage; try_consume()
+  blocks new AI calls until it's topped up.
+- UserAIUsage logs every token-consuming AI call, with a trace back to what
+  was processed. cost_cents is a DecimalField so fractional per-token prices
+  don't truncate to zero.
+- PaymentTransaction records purchases of AI tokens and is the source of
+  truth that feeds UserAICredit via signal.
+- AIPurchasePackage provides predefined token bundles for the frontend.
+
+CHANGELOG
+---------
+- AIServiceConfig: made per-feature model, max_tokens, repair_attempts,
+  and temperature nullable so .env is the default and admin override is
+  optional. Added updated_by for audit. token_cost_cents switched from
+  PositiveIntegerField to DecimalField so fractional cent-per-token prices
+  are expressible. delete() now raises NotImplementedError instead of
+  returning None silently.
+- UserAICredit: removed MinValueValidator(0) from remaining_tokens so exam
+  grading overage can push the balance negative (a valid "user owes"
+  state). Added charge_anyway() for that path. Added grant_allowance()
+  so monthly top-ups don't share a method name with failed-call refunds.
+  reset_monthly_allowances() is now a single SQL UPDATE instead of a
+  Python loop over every user.
+- UserAIUsage.cost_cents: changed from PositiveIntegerField to
+  DecimalField to match token_cost_cents. Existing integer values
+  convert cleanly (X → X.000000).
+- UserAICredit.refund_tokens() (kept from prior revision): a proper refund
+  that ONLY touches remaining_tokens. The AI views previously reused
+  add_tokens() for refunds, which also increments total_purchased_tokens —
+  permanently corrupting each user's lifetime purchase statistics on every
+  failed AI call.
+- Exam.total_marks / ExamQuerySet.with_total_marks() use explicit F()
+  expressions inside Coalesce() instead of bare strings.
+- Document.file: max_length=500 added — the default 100 chars was too short
+  for Cloudinary-style paths.
+- ResearchSubmission: added approved_by / approved_at so lecturer approvals
+  are audit-trailed.
+- ExamAttempt: added last_activity_at, timed_out, abandoned_at so a strict
+  exam session can be enforced server-side.
+- Document: added content_pages (JSON list of {page, text}) so the correction
+  report can cite exact page numbers.
+- CorrectionReport: new model. One row per generated branded correction PDF.
+- StudentProfile / LecturerProfile: added `avatar` (ImageField, nullable,
+  blank).
+- PaymentTransaction.amount_cents: help_text corrected. The field stores
+  the smallest unit of the transaction currency. For UGX (which has no
+  minor unit) that is 1:1 — 5000 = UGX 5,000. For USD/KES/EUR it is cents.
 """
+
+
 import logging
-import os
-import uuid
-from datetime import datetime
 from decimal import Decimal
 
-
-from celery import states
-from celery.result import AsyncResult
-
 from django.conf import settings
-from django.core.cache import cache
-from django.db import IntegrityError, transaction
-from django.db.models import Avg, Q
-from django.shortcuts import get_object_or_404
+from django.contrib.auth.models import AbstractUser
+from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.search import SearchVectorField, SearchVector
+from django.core.exceptions import ValidationError
+from django.core.validators import MinValueValidator, MaxValueValidator
+from django.db import models, transaction
+from django.db.models import Sum, F
+from django.db.models.functions import Coalesce
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 from django.utils import timezone
-
-from rest_framework import status, viewsets, permissions, generics
-from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied, ValidationError as DRFValidationError
-from rest_framework.permissions import AllowAny
-from rest_framework.response import Response
-from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
-from rest_framework.views import APIView
-
-from .ai_services import (
-    AIRequestError, can_afford, check_highlight_ready, check_research_ready,
-    finalize_attempt, get_exam_question_marks, grade_mcq_answers,
-    has_structured_answers, late_note, new_task_id, reset_config_cache,
-    expire_attempt,
-    resolve_max_tokens,
-)
-from .auto_evaluate import kick_off_evaluation
-from .models import (
-    User, Course, Document, ExamAttempt, Enrollment, ResearchSubmission,
-    AIServiceConfig, UserAICredit, PaymentTransaction, AIPurchasePackage,
-    QuestionBank, Question, Exam, Rubric, RubricEvaluation,
-    ExamQuestion, Answer,
-    CorrectionReport, StudentProfile,
-)
-from .serializers import (
-    DocumentSerializer,
-    DocumentSearchResultSerializer,
-    UserAICreditSerializer,
-    AIServiceConfigSerializer,
-    UserSerializer,
-    RegisterSerializer,
-    CourseSerializer,
-    EnrollmentSerializer,
-    QuestionBankSerializer,
-    QuestionSerializer,
-    ExamSerializer,
-    ExamQuestionSerializer,
-    RubricSerializer,
-    ResearchSubmissionSerializer,
-    ResearchSubmissionCreateSerializer,
-    ResearchSubmissionApproveSerializer,
-    SubmissionRosterSerializer,
-    AnswerUpsertSerializer,
-    AnswerDetailSerializer,
-    ExamAttemptDetailSerializer,
-    ExamAttemptForLecturerSerializer,
-    ExamAttemptStartSerializer,
-    CorrectionReportSerializer,
-    PaymentTransactionStatusSerializer,
-    AIPurchasePackageSerializer,
-)
-from .services.document_search import (
-    SearchParams, search_documents, build_facets, suggest_documents,
-)
-from .services.pesapal_service import (
-    PesapalError, register_ipn_url, get_transaction_status, submit_order,
-)
-from .tasks import (
-    highlight_document_task, grade_exam_attempt_task, evaluate_research_task,
-    generate_correction_report_task,
-)
-from .utils.text_extraction import extract_text, extract_text_and_pages
+from cloudinary_storage.storage import RawMediaCloudinaryStorage, MediaCloudinaryStorage
 
 logger = logging.getLogger(__name__)
 
-GENERIC_AI_ERROR = "AI processing failed. Please try again later."
-INFLIGHT_STATES = {states.PENDING, states.RECEIVED, states.STARTED, states.RETRY}
-INFLIGHT_TTL = 120
 
+# =============================================================================
+# Users & profiles
+# =============================================================================
 
-# -----------------------------------------------------------------------------
-# Throttles
-# -----------------------------------------------------------------------------
+class User(AbstractUser):
+    """
+    Custom user model, extending Django's AbstractUser with a `role` field.
+    """
+    class Role(models.TextChoices):
+        STUDENT = 'STUDENT', 'Student'
+        LECTURER = 'LECTURER', 'Lecturer'
+        ADMIN = 'ADMIN', 'Administrator'
 
-class AICallThrottle(UserRateThrottle):
-    scope = "ai_calls"
-
-
-class PurchaseThrottle(UserRateThrottle):
-    scope = "ai_purchase"
-
-
-class RegisterThrottle(AnonRateThrottle):
-    scope = "register"
-
-
-# -----------------------------------------------------------------------------
-# Helpers & permissions
-# -----------------------------------------------------------------------------
-
-def parse_positive_int(value):
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return None
-    return number if number > 0 else None
-
-
-def _parse_iso_date(raw):
-    if not raw:
-        return None
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
-        return None
-
-
-def is_student(user):
-    return user.is_authenticated and user.role == User.Role.STUDENT
-
-
-def is_lecturer(user):
-    return user.is_authenticated and user.role == User.Role.LECTURER
-
-
-def is_admin(user):
-    return user.is_authenticated and (user.is_superuser or user.role == User.Role.ADMIN)
-
-
-def eager_mode():
-    return getattr(settings, "CELERY_TASK_ALWAYS_EAGER", True)
-
-
-def debug_mode():
-    return bool(getattr(settings, "DEBUG", False))
-
-
-class IsAppAdmin(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return is_admin(request.user)
-
-
-class IsLecturerOrAdmin(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return is_lecturer(request.user) or is_admin(request.user)
-
-
-class IsUploaderOrAdminForWrites(permissions.BasePermission):
-    def has_object_permission(self, request, view, obj):
-        if request.method in permissions.SAFE_METHODS:
-            return True
-        return is_admin(request.user) or obj.uploaded_by_id == request.user.id
-
-
-def user_can_use_course(user, course):
-    if is_admin(user):
-        return True
-    if is_lecturer(user):
-        return Course.objects.filter(pk=course.pk, lecturer__user=user).exists()
-    profile = getattr(user, "student_profile", None)
-    if profile is None:
-        return False
-    return Enrollment.objects.filter(student=profile, course=course).exists()
-
-
-def _run_inline(task, args, task_id):
-    try:
-        result = task.apply(args=args, task_id=task_id).get(disable_sync_subtasks=False)
-        return "sync", result
-    except Exception as exc:
-        logger.exception(
-            "Inline task %s FAILED | args=%r | error=%s",
-            getattr(task, "name", task), args, exc,
-        )
-        return "error", exc
-
-
-def dispatch(task, args, user, dedupe_key=None):
-    task_id = new_task_id(user)
-
-    if eager_mode():
-        return _run_inline(task, args, task_id)
-
-    if dedupe_key:
-        try:
-            existing = cache.get(dedupe_key)
-            if existing and AsyncResult(existing).state in INFLIGHT_STATES:
-                return "async", existing
-        except Exception as exc:
-            logger.warning("Dedupe lookup failed (%s); enqueueing anyway.", exc)
-
-    try:
-        ar = task.apply_async(args=args, task_id=task_id)
-    except Exception as exc:
-        logger.exception(
-            "Enqueue %s FAILED | args=%r | error=%s",
-            getattr(task, "name", task), args, exc,
-        )
-        if getattr(settings, "AI_FALLBACK_TO_EAGER", False):
-            logger.warning("Broker unreachable; running %s inline.", getattr(task, "name", task))
-            return _run_inline(task, args, task_id)
-        return "error", exc
-
-    if dedupe_key:
-        try:
-            cache.set(dedupe_key, ar.id, INFLIGHT_TTL)
-        except Exception as exc:
-            logger.warning("Dedupe store failed: %s", exc)
-    return "async", ar.id
-
-
-def task_error_response(exc):
-    if debug_mode():
-        return Response(
-            {"error": f"AI task failed: {type(exc).__name__}: {exc}"},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        )
-    return Response(
-        {"error": "The AI service is temporarily unavailable. Please try again shortly."},
-        status=status.HTTP_503_SERVICE_UNAVAILABLE,
+    role = models.CharField(
+        max_length=20,
+        choices=Role.choices,
+        default=Role.STUDENT,
+        db_index=True,
+        help_text="Which portal/permission set this account uses.",
+    )
+    email = models.EmailField(
+        unique=True,
+        help_text="Used for login/notifications; must be unique across all accounts.",
     )
 
-
-def task_failed_response(payload):
-    if not isinstance(payload, dict):
-        payload = {}
-    code = payload.get("code")
-    if not isinstance(code, int) or not 400 <= code <= 599:
-        code = status.HTTP_503_SERVICE_UNAVAILABLE
-    return Response({"error": payload.get("error") or GENERIC_AI_ERROR}, status=code)
+    def __str__(self):
+        return f"{self.username} ({self.role})"
 
 
-def task_ok(payload):
-    return isinstance(payload, dict) and payload.get("ok") is True
+@receiver(post_save, sender=User)
+def create_ai_credit_for_new_user(sender, instance, created, **kwargs):
+    """Auto-create a UserAICredit row for every new user."""
+    if created:
+        UserAICredit.objects.get_or_create(user=instance)
 
 
-def accepted(task_id):
-    return Response(
-        {"task_id": task_id, "status": "queued"},
-        status=status.HTTP_202_ACCEPTED,
+class StudentProfile(models.Model):
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='student_profile',
+        help_text="The underlying auth account. Deleting the user deletes this profile.",
+    )
+    student_id = models.CharField(max_length=20, unique=True, help_text="Institution-issued student number.")
+    department = models.CharField(max_length=100, blank=True, db_index=True)
+    enrollment_year = models.PositiveIntegerField(
+        null=True, blank=True,
+        validators=[MinValueValidator(1900), MaxValueValidator(2100)],
+        help_text="Calendar year the student enrolled, e.g. 2024.",
+    )
+    avatar = models.ImageField(
+        upload_to="avatars/students/%Y/%m/",
+        storage=MediaCloudinaryStorage(),
+        max_length=500,
+        null=True, blank=True,
+        help_text="Profile picture. Nullable — students without one show initials.",
     )
 
-
-# ─── Exam submission — two-phase, deadlock-free ─────────────────────
-
-def _perform_exam_submit_prepare(attempt):
-    """
-    Phase 1 — synchronous portion of exam submission.
-    Assumes caller holds the row lock.
-    """
-    if attempt.status != ExamAttempt.Status.IN_PROGRESS:
-        return Response(
-            {"error": "Attempt is already submitted or graded."},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    now = timezone.now()
-    attempt.status = ExamAttempt.Status.SUBMITTED
-    attempt.submitted_at = now
-    attempt.end_time = now
-    note = late_note(attempt, now)
-    if note:
-        attempt.feedback = note
-    attempt.save(update_fields=["status", "submitted_at", "end_time", "feedback"])
-
-    exam_marks = get_exam_question_marks(attempt.exam)
-    grade_mcq_answers(attempt, exam_marks)
-
-    # No structured answers → finalize now, no AI needed.
-    if not has_structured_answers(attempt, exam_marks):
-        result = finalize_attempt(attempt.id, exam_marks)
-        attempt.refresh_from_db()
-        return Response(
-            {
-                "message": "Exam submitted and graded.",
-                "attempt_id": attempt.id,
-                "status": attempt.status,
-                "score": str(attempt.score) if attempt.score is not None else None,
-                **result,
-            },
-            status=status.HTTP_200_OK,
-        )
-
-    # Structured answers exist → hand off to phase 2.
-    return {"attempt_id": attempt.id}
+    def __str__(self):
+        return self.user.get_full_name() or self.user.username
 
 
-def _perform_exam_submit_grade(request, payload):
-    """
-    Phase 2 — asynchronous AI grading.
-    Runs outside any transaction and does NOT hold the attempt lock.
-    """
-    attempt_id = payload["attempt_id"]
-
-    mode, task_result = dispatch(
-        grade_exam_attempt_task, [attempt_id], request.user
+class LecturerProfile(models.Model):
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='lecturer_profile',
+    )
+    staff_id = models.CharField(max_length=20, unique=True, help_text="Institution-issued staff number.")
+    department = models.CharField(max_length=100, blank=True, db_index=True)
+    designation = models.CharField(max_length=100, blank=True, help_text='e.g. "Senior Lecturer", "Professor".')
+    avatar = models.ImageField(
+        upload_to="avatars/lecturers/%Y/%m/",
+        storage=MediaCloudinaryStorage(),
+        max_length=500,
+        null=True, blank=True,
+        help_text="Profile picture. Nullable — lecturers without one show initials.",
     )
 
-    try:
-        attempt = ExamAttempt.objects.get(pk=attempt_id)
-    except ExamAttempt.DoesNotExist:
-        return Response(
-            {"error": "Attempt disappeared during grading."},
-            status=status.HTTP_404_NOT_FOUND,
-        )
-
-    if mode == "sync" and task_ok(task_result):
-        attempt.refresh_from_db()
-        graded = attempt.status == ExamAttempt.Status.GRADED
-        return Response(
-            {
-                "message": ("Exam submitted and graded." if graded else
-                            "Exam submitted. Some answers await manual grading."),
-                "attempt_id": attempt.id,
-                "status": attempt.status,
-                "score": str(attempt.score) if attempt.score is not None else None,
-                "pending_manual_grading":
-                    (task_result.get("data") or {}).get("pending_manual_grading"),
-            },
-            status=status.HTTP_200_OK,
-        )
-
-    if mode == "async":
-        return Response(
-            {
-                "message": "Exam submitted. Marking is in progress.",
-                "attempt_id": attempt.id,
-                "status": attempt.status,
-                "task_id": task_result,
-            },
-            status=status.HTTP_202_ACCEPTED,
-        )
-
-    resp = (task_failed_response(task_result) if mode == "sync"
-            else task_error_response(task_result))
-    resp.data["attempt_id"] = attempt.id
-    resp.data["status"] = attempt.status
-    resp.data["message"] = "Exam submitted but AI marking failed."
-    return resp
-
-
-def _grade_band(pct):
-    if pct is None:
-        return None
-    if pct >= 80:
-        return "A"
-    if pct >= 70:
-        return "B"
-    if pct >= 60:
-        return "C"
-    if pct >= 50:
-        return "D"
-    return "F"
+    def __str__(self):
+        return self.user.get_full_name() or self.user.username
 
 
 # =============================================================================
-# Current user
+# Courses & enrollment
 # =============================================================================
 
-class UserMeView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request):
-        return Response(UserSerializer(request.user).data)
-
-
-# =============================================================================
-# Registration
-# =============================================================================
-
-class RegisterView(generics.CreateAPIView):
-    serializer_class = RegisterSerializer
-    permission_classes = [AllowAny]
-    throttle_classes = [RegisterThrottle]
-
-
-# =============================================================================
-# Task status
-# =============================================================================
-
-class AITaskStatusView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request, task_id):
-        if not is_admin(request.user) and not task_id.startswith(f"u{request.user.id}-"):
-            return Response({"error": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        result = AsyncResult(task_id)
-        state = result.state
-        ready = state in states.READY_STATES
-        if state == states.SUCCESS:
-            payload = result.result if isinstance(result.result, dict) else {}
-            return Response({"state": state, "ready": True, **payload})
-        if state in (states.FAILURE, states.REVOKED):
-            return Response({"state": state, "ready": True, "ok": False,
-                             "error": GENERIC_AI_ERROR})
-        return Response({"state": state, "ready": ready})
-
-
-# =============================================================================
-# AI Highlighting
-# =============================================================================
-
-class AIHighlightView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-    throttle_classes = [AICallThrottle]
-
-    def post(self, request):
-        document_id = parse_positive_int(request.data.get("document_id"))
-        if document_id is None:
-            return Response(
-                {"error": "document_id is required and must be a positive integer."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        document = get_object_or_404(
-            Document.objects.visible_to(request.user), pk=document_id
-        )
-
-        try:
-            check_highlight_ready(document)
-        except AIRequestError as exc:
-            return Response({"error": str(exc)}, status=exc.status_code)
-
-        if not can_afford(
-            request.user, document.content_text, resolve_max_tokens("highlight")
-        ):
-            return Response(
-                {"error": "Insufficient AI tokens. Please purchase more."},
-                status=status.HTTP_402_PAYMENT_REQUIRED,
-            )
-
-        mode, payload = dispatch(
-            highlight_document_task,
-            [document.id, request.user.id],
-            request.user,
-            dedupe_key=f"ai:inflight:highlight:{request.user.id}:{document.id}",
-        )
-
-        if mode == "sync":
-            if not task_ok(payload):
-                return task_failed_response(payload)
-            return Response(
-                {"status": "completed", "result": payload},
-                status=status.HTTP_200_OK,
-            )
-        if mode == "async":
-            return accepted(payload)
-        return task_error_response(payload)
-
-
-# =============================================================================
-# Exam submission (legacy alias)
-# =============================================================================
-
-class ExamSubmitView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-    throttle_classes = [AICallThrottle]
-
-    def post(self, request):
-        attempt_id = parse_positive_int(request.data.get("attempt_id"))
-        if attempt_id is None:
-            return Response(
-                {"error": "attempt_id is required and must be a positive integer."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        attempts = ExamAttempt.objects.select_related("exam", "student__user")
-        if not is_admin(request.user):
-            attempts = attempts.filter(student__user=request.user)
-
-        with transaction.atomic():
-            attempt = get_object_or_404(
-                attempts.select_for_update(of=("self",)), pk=attempt_id
-            )
-            prepare_result = _perform_exam_submit_prepare(attempt)
-
-        if isinstance(prepare_result, Response):
-            return prepare_result
-
-        return _perform_exam_submit_grade(request, prepare_result)
-
-
-# =============================================================================
-# Research guidance
-# =============================================================================
-
-class ResearchGuidanceView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-    throttle_classes = [AICallThrottle]
-
-    def post(self, request):
-        submission_id = parse_positive_int(request.data.get("submission_id"))
-        if submission_id is None:
-            return Response(
-                {"error": "submission_id is required and must be a positive integer."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        submissions = ResearchSubmission.objects.select_related(
-            "student__user", "document", "rubric"
-        )
-        if not is_admin(request.user):
-            submissions = submissions.filter(student__user=request.user)
-        submission = get_object_or_404(submissions, pk=submission_id)
-
-        try:
-            check_research_ready(submission)
-        except AIRequestError as exc:
-            return Response({"error": str(exc)}, status=exc.status_code)
-
-        if not can_afford(
-            submission.student.user,
-            submission.document.content_text,
-            resolve_max_tokens("research_guidance"),
-        ):
-            return Response(
-                {"error": "Insufficient AI tokens."},
-                status=status.HTTP_402_PAYMENT_REQUIRED,
-            )
-
-        mode, payload = dispatch(
-            evaluate_research_task, [submission.id], request.user,
-            dedupe_key=f"ai:inflight:research:{request.user.id}:{submission.id}",
-        )
-
-        if mode == "sync":
-            if not task_ok(payload):
-                return task_failed_response(payload)
-            submission.refresh_from_db()
-            return Response(
-                {
-                    "status": "completed",
-                    "submission_id": submission.id,
-                    "evaluation_status": submission.evaluation_status,
-                    "overall_score": (
-                        str(submission.overall_score)
-                        if submission.overall_score is not None else None
-                    ),
-                },
-                status=status.HTTP_200_OK,
-            )
-        if mode == "async":
-            return accepted(payload)
-        return task_error_response(payload)
-
-
-# =============================================================================
-# Token balance & purchase
-# =============================================================================
-
-class TokenBalanceView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request):
-        credit, _ = UserAICredit.objects.get_or_create(user=request.user)
-        return Response(UserAICreditSerializer(credit).data)
-
-
-class AIPurchasePackageListView(generics.ListAPIView):
-    serializer_class = AIPurchasePackageSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    pagination_class = None
-
-    def get_queryset(self):
-        return AIPurchasePackage.objects.filter(is_active=True)
-
-
-class PurchaseTokensView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-    throttle_classes = [PurchaseThrottle]
-
-    def post(self, request):
-        if (not settings.PESAPAL_CONSUMER_KEY
-                or not settings.PESAPAL_CONSUMER_SECRET):
-            return Response(
-                {"error": "Payments are not configured. Contact the administrator."},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-
-        if not settings.PESAPAL_IPN_ID:
-            return Response(
-                {"error": "Payment gateway is not ready (missing IPN ID). "
-                          "Ask the admin to run /api/payments/register-ipn/."},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-
-        config = AIServiceConfig.load()
-        raw_package_id = request.data.get("package_id")
-
-        # ── Resolve amount + tokens ────────────────────────────
-        if raw_package_id not in (None, ""):
-            package_id = parse_positive_int(raw_package_id)
-            if package_id is None:
-                return Response(
-                    {"error": "package_id must be a positive integer."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            package = get_object_or_404(
-                AIPurchasePackage, pk=package_id, is_active=True
-            )
-            amount_cents, tokens = package.price_cents, package.tokens
-        else:
-            if not config.allow_pay_as_you_go:
-                return Response(
-                    {"error": "Custom token purchases are currently disabled."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-            amount_cents = parse_positive_int(request.data.get("amount_cents"))
-            if amount_cents is None:
-                return Response(
-                    {"error": "Provide package_id, or a positive integer "
-                              "amount_cents."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            # ── Decimal-safe token calculation ──────────────────
-            token_cost = config.token_cost_cents or Decimal("0")
-            if token_cost <= 0:
-                logger.error(
-                    "PurchaseTokensView: token_cost_cents=%s is not positive; "
-                    "refusing to sell tokens at that price.",
-                    config.token_cost_cents,
-                )
-                return Response(
-                    {"error": "Token pricing is not configured. "
-                              "Please contact an administrator."},
-                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
-                )
-            tokens = int(Decimal(amount_cents) / token_cost)
-
-            if tokens < 1:
-                return Response(
-                    {"error": "Amount is too small to buy any tokens."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            if (config.max_purchasable_tokens is not None
-                    and tokens > config.max_purchasable_tokens):
-                return Response(
-                    {"error": f"Cannot purchase more than "
-                              f"{config.max_purchasable_tokens} tokens at once."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-        # ── Billing info (PESAPAL FIX) ─────────────────────────
-        # Every value MUST be a string. Pesapal rejects `null` with:
-        #   "Middle Name cannot be null or empty"
-        # Field names are snake_case: `line_1`, not `line1`.
-        # We accept both `line_1` and `line1` from the client for
-        # backwards compatibility.
-        full_name = (request.user.get_full_name() or "").strip()
-        name_parts = full_name.split(" ", 1) if full_name else []
-        first_from_name = name_parts[0] if name_parts else ""
-        last_from_name = name_parts[1] if len(name_parts) > 1 else ""
-
-        billing = {
-            "email_address": request.user.email or "noemail@campusos.local",
-            "phone_number": str(
-                request.data.get("phone_number") or "0700000000"
-            ),
-            "country_code": str(
-                request.data.get("country_code") or "UG"
-            ).upper(),
-            "first_name": (
-                (request.user.first_name or first_from_name).strip()
-                or request.user.username
-                or "Student"
-            ),
-            "middle_name": str(request.data.get("middle_name") or ""),
-            "last_name": (
-                (request.user.last_name or last_from_name).strip()
-                or "User"
-            ),
-            "line_1": str(
-                request.data.get("line_1")
-                or request.data.get("line1")
-                or "Kampala"
-            ),
-            "line_2": str(request.data.get("line_2") or ""),
-            "city": str(request.data.get("city") or "Kampala"),
-            "state": str(request.data.get("state") or ""),
-            "postal_code": str(request.data.get("postal_code") or ""),
-            "zip_code": str(request.data.get("zip_code") or ""),
-        }
-
-        # ── Create the PENDING transaction row ─────────────────
-        reference = f"campusos-{uuid.uuid4().hex[:20]}"
-
-        # ── amount_cents is in the smallest unit of the currency.
-        #    For UGX (no minor unit) that is 1:1 — send as-is.
-        #    If you switch currency to one with cents (USD/KES/EUR),
-        #    change to `amount_cents / 100.0`.
-        amount_major = float(amount_cents)
-
-        payment = PaymentTransaction.objects.create(
-            user=request.user,
-            amount_cents=amount_cents,
-            tokens_purchased=tokens,
-            status=PaymentTransaction.Status.PENDING,
-            transaction_id=reference,
-            pesapal_merchant_reference=reference,
-        )
-
-        # ── Submit to Pesapal ──────────────────────────────────
-        try:
-            data = submit_order(
-                merchant_reference=reference,
-                amount=amount_major,
-                currency="UGX",
-                description=f"{tokens} CampusOS AI tokens",
-                callback_url=settings.PESAPAL_CALLBACK_URL,
-                notification_id=settings.PESAPAL_IPN_ID,
-                billing=billing,
-            )
-        except PesapalError as exc:
-            logger.exception(
-                "Pesapal submit failed for %s | payload=%r",
-                reference, getattr(exc, "payload", None),
-            )
-            payment.mark_failed(reason=str(exc))
-            return Response(
-                {"error": str(exc)},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-
-        # ── Persist Pesapal identifiers for the IPN handler ────
-        payment.pesapal_tracking_id = data.get("order_tracking_id")
-        payment.redirect_url = data.get("redirect_url")
-        payment.raw_pesapal_response = data
-        payment.save(update_fields=[
-            "pesapal_tracking_id", "redirect_url", "raw_pesapal_response",
-        ])
-
-        return Response(
-            {
-                "payment_url": data.get("redirect_url"),
-                "transaction_id": payment.id,
-                "reference": reference,
-            },
-            status=status.HTTP_200_OK,
-        )
-
-
-# =============================================================================
-# Pesapal payment views
-# =============================================================================
-
-class PesapalIPNView(APIView):
-    permission_classes = [AllowAny]
-    authentication_classes = []
-
-    def _extract_ids(self, request):
-        data = request.data or {}
-        query = request.query_params or {}
-
-        def pick(key):
-            return data.get(key) or query.get(key)
-
-        return {
-            "tracking_id": pick("OrderTrackingId")
-                           or pick("pesapal_transaction_tracking_id"),
-            "merchant_ref": pick("OrderMerchantReference")
-                            or pick("pesapal_merchant_reference"),
-            "notification_type": pick("OrderNotificationType")
-                                 or pick("pesapal_notification_type"),
-        }
-
-    def _handle(self, request):
-        ids = self._extract_ids(request)
-        tracking_id = ids["tracking_id"]
-        merchant_ref = ids["merchant_ref"]
-
-        logger.info(
-            "Pesapal IPN received: tracking=%s ref=%s type=%s",
-            tracking_id, merchant_ref, ids["notification_type"],
-        )
-
-        if not tracking_id or not merchant_ref:
-            return Response(
-                {"error": "Missing tracking id or merchant reference."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        payment = PaymentTransaction.objects.filter(
-            pesapal_merchant_reference=merchant_ref
-        ).first()
-        if payment is None:
-            logger.warning("Pesapal IPN for unknown reference %s", merchant_ref)
-            return Response({"status": "ignored"})
-
-        if payment.status == PaymentTransaction.Status.SUCCESS:
-            return Response({"status": "already-processed"})
-
-        try:
-            status_data = get_transaction_status(tracking_id)
-        except PesapalError as exc:
-            logger.exception("IPN status verify failed for %s", merchant_ref)
-            return Response(
-                {"error": str(exc)},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-
-        payment.raw_pesapal_response = status_data
-        payment.save(update_fields=["raw_pesapal_response"])
-
-        status_code = int(status_data.get("status_code", 0))
-        description = (
-            status_data.get("payment_status_description") or ""
-        ).lower()
-
-        if status_code == 1 and "completed" in description:
-            payment.mark_successful()
-            logger.info(
-                "Pesapal payment SUCCESS: %s → +%s tokens",
-                merchant_ref, payment.tokens_purchased,
-            )
-        elif status_code in (2, 0) and (
-            "failed" in description or "invalid" in description
-        ):
-            payment.mark_failed(reason=description or "Pesapal reported failure")
-            logger.warning("Pesapal payment FAILED: %s", merchant_ref)
-        else:
-            logger.info(
-                "Pesapal payment still pending: %s (%s)",
-                merchant_ref, status_data.get("payment_status_description"),
-            )
-
-        return Response({
-            "orderNotificationType": ids["notification_type"] or "IPNCHANGE",
-            "orderTrackingId": tracking_id,
-            "orderMerchantReference": merchant_ref,
-            "status": 200,
-        })
-
-    def get(self, request):
-        return self._handle(request)
-
-    def post(self, request):
-        return self._handle(request)
-
-
-class PaymentStatusView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    PESAPAL_LOOKUP_COOLDOWN = 10
-
-    def get(self, request, transaction_id):
-        payment = get_object_or_404(
-            PaymentTransaction, pk=transaction_id, user=request.user
-        )
-
-        if payment.status in (
-            PaymentTransaction.Status.SUCCESS,
-            PaymentTransaction.Status.FAILED,
-            PaymentTransaction.Status.REFUNDED,
-        ):
-            return Response(PaymentTransactionStatusSerializer(payment).data)
-
-        cache_key = f"pesapal:status-check:{payment.id}"
-        if payment.pesapal_tracking_id and not cache.get(cache_key):
-            cache.set(cache_key, 1, self.PESAPAL_LOOKUP_COOLDOWN)
-            try:
-                status_data = get_transaction_status(
-                    payment.pesapal_tracking_id
-                )
-                code = int(status_data.get("status_code", 0))
-                desc = (
-                    status_data.get("payment_status_description") or ""
-                ).lower()
-                err = status_data.get("error") or {}
-                err_code = (err.get("code") or "").lower()
-
-                payment.raw_pesapal_response = status_data
-                payment.save(update_fields=["raw_pesapal_response"])
-
-                if code == 1 and "completed" in desc:
-                    payment.mark_successful()
-                    logger.info(
-                        "Payment %s self-healed via poll → SUCCESS, +%s tokens",
-                        payment.id, payment.tokens_purchased,
-                    )
-                elif code in (2, 3) and (
-                    "failed" in desc
-                    or "invalid" in desc
-                    or "reversed" in desc
-                ):
-                    payment.mark_failed(
-                        reason=desc or "Pesapal reported failure"
-                    )
-                    logger.info(
-                        "Payment %s marked FAILED via poll", payment.id
-                    )
-                elif (
-                    err_code == "payment_details_not_found"
-                    or "invalid" in desc
-                ):
-                    payment.mark_failed(
-                        reason="No payment attempted"
-                    )
-                    logger.info(
-                        "Payment %s marked FAILED (abandoned) via poll",
-                        payment.id,
-                    )
-            except PesapalError as exc:
-                logger.warning(
-                    "Poll could not verify payment %s with Pesapal: %s",
-                    payment.id, exc,
-                )
-
-        payment.refresh_from_db()
-        return Response(PaymentTransactionStatusSerializer(payment).data)
-
-
-class RegisterIPNView(APIView):
-    permission_classes = [permissions.IsAuthenticated, IsAppAdmin]
-
-    def post(self, request):
-        try:
-            ipn_id = register_ipn_url(settings.PESAPAL_IPN_URL)
-        except PesapalError as exc:
-            return Response(
-                {"error": str(exc)},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-        return Response({
-            "ipn_id": ipn_id,
-            "message": "Copy this into .env as PESAPAL_IPN_ID and restart Django.",
-        })
-
-
-# =============================================================================
-# AI Configuration
-# =============================================================================
-
-class AIServiceConfigView(APIView):
-    def get_permissions(self):
-        if self.request.method in permissions.SAFE_METHODS:
-            return [permissions.IsAuthenticated()]
-        return [permissions.IsAuthenticated(), IsAppAdmin()]
-
-    def get(self, request):
-        return Response(AIServiceConfigSerializer(AIServiceConfig.load()).data)
-
-    def _update(self, request):
-        serializer = AIServiceConfigSerializer(
-            AIServiceConfig.load(), data=request.data, partial=True
-        )
-        serializer.is_valid(raise_exception=True)
-
-        obj = serializer.save()
-        obj.updated_by = request.user
-        obj.save(update_fields=["updated_by"])
-
-        reset_config_cache()
-        return Response(serializer.data)
-
-    def put(self, request):
-        return self._update(request)
-
-    def patch(self, request):
-        return self._update(request)
-
-
-# =============================================================================
-# Document viewset
-# =============================================================================
-
-class DocumentViewSet(viewsets.ModelViewSet):
-    serializer_class = DocumentSerializer
-    permission_classes = [permissions.IsAuthenticated, IsUploaderOrAdminForWrites]
-
-    def get_queryset(self):
-        return Document.objects.visible_to(self.request.user).with_uploader()
-
-    def get_serializer_context(self):
-        context = super().get_serializer_context()
-        context["request"] = self.request
-        return context
-
-    def _validate_course(self, serializer):
-        course = serializer.validated_data.get("course")
-        if course is not None and not user_can_use_course(self.request.user, course):
-            raise PermissionDenied("You cannot attach documents to this course.")
-
-    @staticmethod
-    def _validate_file(serializer):
-        upload = serializer.validated_data.get("file")
-        if upload is None:
-            return
-
-        allowed = getattr(
-            settings,
-            "DOCUMENT_ALLOWED_EXTENSIONS",
-            {
-                ".pdf", ".docx", ".doc",
-                ".odt", ".rtf",
-                ".pptx", ".ppt",
-                ".xlsx", ".xls", ".csv",
-                ".txt", ".md",
-            },
-        )
-        max_bytes = getattr(settings, "DOCUMENT_MAX_UPLOAD_BYTES", 25 * 1024 * 1024)
-        extension = os.path.splitext(upload.name)[1].lower()
-
-        if extension not in allowed:
-            friendly = ", ".join(sorted(allowed))
-            raise DRFValidationError({
-                "file": [
-                    f"File type '{extension}' is not supported. "
-                    f"Allowed formats: {friendly}."
-                ]
-            })
-
-        if upload.size > max_bytes:
-            raise DRFValidationError({
-                "file": [
-                    f"File is too large "
-                    f"(max {max_bytes // (1024 * 1024)} MB)."
-                ]
-            })
-
-    @staticmethod
-    def _warn_if_empty_extraction(document, context: str):
-        text = document.content_text or ""
-        if len(text.strip()) < 50:
-            logger.warning(
-                "Document %s (%s) %s but extraction produced %d chars. "
-                "This document cannot be AI-evaluated.",
-                document.id, document.file.name, context, len(text),
-            )
-
-    def perform_create(self, serializer):
-        self._validate_course(serializer)
-        self._validate_file(serializer)
-        document = serializer.save(uploaded_by=self.request.user)
-
-        text, pages = extract_text_and_pages(document.file)
-        document.content_text = text
-        document.content_pages = pages
-        document.save(update_fields=["content_text", "content_pages"])
-
-        self._warn_if_empty_extraction(document, "uploaded")
-
-    def perform_update(self, serializer):
-        self._validate_course(serializer)
-        self._validate_file(serializer)
-        replacing_file = "file" in serializer.validated_data
-        document = serializer.save()
-
-        if replacing_file:
-            text, pages = extract_text_and_pages(document.file)
-            document.content_text = text
-            document.content_pages = pages
-            document.save(update_fields=["content_text", "content_pages"])
-
-            self._warn_if_empty_extraction(document, "re-uploaded")
-
-
-# =============================================================================
-# Document search & suggestions
-# =============================================================================
-
-class DocumentSearchView(generics.ListAPIView):
-    serializer_class = DocumentSearchResultSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        qs, _ = search_documents(self.request.user, self._params())
-        return qs
-
-    def list(self, request, *args, **kwargs):
-        response = super().list(request, *args, **kwargs)
-        try:
-            response.data["facets"] = build_facets(request.user, self._params())
-        except Exception:
-            logger.exception("Facet computation failed")
-            response.data["facets"] = []
-        return response
-
-    def _params(self):
-        qp = self.request.query_params
-        return SearchParams(
-            query=qp.get("q"),
-            category=qp.get("category"),
-            visibility=qp.get("visibility"),
-            course_id=parse_positive_int(qp.get("course_id")),
-            uploaded_by_id=parse_positive_int(qp.get("uploaded_by")),
-            ordering=qp.get("ordering", "relevance"),
-        )
-
-
-class DocumentSuggestView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request):
-        prefix = request.query_params.get("q", "")
-        limit = min(parse_positive_int(request.query_params.get("limit")) or 10, 25)
-        suggestions = suggest_documents(request.user, prefix, limit)
-        return Response({"suggestions": suggestions})
-
-
-# =============================================================================
-# Lecturer dashboard
-# =============================================================================
-
-class LecturerDashboardView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request):
-        user = request.user
-
-        if not (is_lecturer(user) or is_admin(user)):
-            return Response(
-                {"error": "Lecturer access required."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        my_courses = Course.objects.filter(lecturer__user=user)
-        my_documents = Document.objects.filter(uploaded_by=user)
-        my_banks = QuestionBank.objects.filter(created_by=user)
-        my_exams = Exam.objects.filter(course__lecturer__user=user)
-        my_rubrics = Rubric.objects.filter(created_by=user)
-
-        to_review = (
-            ResearchSubmission.objects
-            .filter(
-                Q(course__lecturer__user=user) | Q(rubric__created_by=user),
-                evaluation_status=ResearchSubmission.Status.EVALUATED,
-            )
-            .distinct()
-        )
-
-        credit, _ = UserAICredit.objects.get_or_create(user=user)
-
-        stats = {
-            "courses": my_courses.count(),
-            "documents": my_documents.count(),
-            "question_banks": my_banks.count(),
-            "questions": Question.objects.filter(bank__created_by=user).count(),
-            "exams": my_exams.count(),
-            "published_exams": my_exams.filter(is_published=True).count(),
-            "rubrics": my_rubrics.count(),
-            "pending_submissions": to_review.count(),
-            "tokens_remaining": max(0, credit.remaining_tokens),
-        }
-
-        recent_docs = list(
-            my_documents.order_by("-created_at")[:5]
-            .values("id", "title", "category", "created_at")
-        )
-
-        recent_exams = list(
-            my_exams.order_by("-created_at")[:5].values(
-                "id", "title", "is_published", "created_at",
-                "course__code", "course__title",
-            )
-        )
-        for e in recent_exams:
-            e["course"] = {
-                "code": e.pop("course__code"),
-                "title": e.pop("course__title"),
-            }
-
-        pending = list(
-            to_review.order_by("-submitted_at")[:5].values(
-                "id", "submitted_at", "evaluation_status",
-                "student__student_id",
-                "student__user__first_name",
-                "student__user__last_name",
-                "document__title",
-            )
-        )
-        for p in pending:
-            sid = p.pop("student__student_id")
-            fn = p.pop("student__user__first_name")
-            ln = p.pop("student__user__last_name")
-            p["student"] = {
-                "student_id": sid,
-                "name": f"{fn} {ln}".strip() or sid,
-            }
-            p["document_title"] = p.pop("document__title")
-
-        courses = list(
-            my_courses.order_by("code")[:6].values("id", "code", "title", "department")
-        )
-
-        return Response({
-            "stats": stats,
-            "courses": courses,
-            "recent_documents": recent_docs,
-            "recent_exams": recent_exams,
-            "pending_submissions": pending,
-        })
-
-
-# =============================================================================
-# Student dashboard
-# =============================================================================
-
-class StudentDashboardView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request):
-        user = request.user
-
-        if not is_student(user):
-            return Response(
-                {"error": "Student access required."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        profile = getattr(user, "student_profile", None)
-        if profile is None:
-            return Response(
-                {"error": "No student profile found for this account."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        my_enrollments = Enrollment.objects.filter(student=profile).select_related(
-            "course", "course__lecturer__user"
-        )
-        my_submissions = ResearchSubmission.objects.filter(student=profile)
-        my_documents = Document.objects.filter(uploaded_by=user)
-        my_attempts = ExamAttempt.objects.filter(student=profile).select_related(
-            "exam", "exam__course"
-        )
-
-        credit, _ = UserAICredit.objects.get_or_create(user=user)
-
-        stats = {
-            "enrolled_courses": my_enrollments.count(),
-            "documents": my_documents.count(),
-            "submissions": my_submissions.count(),
-            "pending_evaluation": my_submissions.filter(
-                evaluation_status=ResearchSubmission.Status.PENDING
-            ).count(),
-            "evaluated": my_submissions.filter(
-                evaluation_status=ResearchSubmission.Status.EVALUATED
-            ).count(),
-            "reviewed": my_submissions.filter(
-                evaluation_status=ResearchSubmission.Status.REVIEWED
-            ).count(),
-            "tokens_remaining": max(0, credit.remaining_tokens),
-            "exams_attempted": my_attempts.count(),
-            "exams_graded": my_attempts.filter(
-                status=ExamAttempt.Status.GRADED
-            ).count(),
-            "exams_in_progress": my_attempts.filter(
-                status=ExamAttempt.Status.IN_PROGRESS
-            ).count(),
-        }
-
-        recent_docs = list(
-            my_documents.order_by("-created_at")[:5]
-            .values("id", "title", "category", "created_at")
-        )
-
-        recent_subs = list(
-            my_submissions.order_by("-submitted_at")[:5].values(
-                "id", "submitted_at", "evaluation_status", "overall_score",
-                "document__title",
-                "course__code", "course__title",
-            )
-        )
-        for s in recent_subs:
-            s["document_title"] = s.pop("document__title")
-            code = s.pop("course__code")
-            title = s.pop("course__title")
-            s["course"] = {"code": code, "title": title} if code else None
-
-        courses = list(
-            my_enrollments.order_by("course__code").values(
-                "course__id", "course__code", "course__title",
-                "course__department", "semester",
-                "course__lecturer__user__first_name",
-                "course__lecturer__user__last_name",
-            )[:6]
-        )
-        for c in courses:
-            cid = c.pop("course__id")
-            code = c.pop("course__code")
-            title = c.pop("course__title")
-            dept = c.pop("course__department")
-            fn = c.pop("course__lecturer__user__first_name") or ""
-            ln = c.pop("course__lecturer__user__last_name") or ""
-            c["course"] = {"id": cid, "code": code, "title": title, "department": dept}
-            c["lecturer_name"] = f"{fn} {ln}".strip() or None
-
-        exam_performance = self._build_exam_performance(my_attempts)
-        available_exams = self._build_available_exams(profile)
-        in_progress = self._build_in_progress_attempts(my_attempts)
-
-        return Response({
-            "stats": stats,
-            "courses": courses,
-            "recent_documents": recent_docs,
-            "recent_submissions": recent_subs,
-            "exam_performance": exam_performance,
-            "available_exams": available_exams,
-            "in_progress_attempts": in_progress,
-        })
-
-    @staticmethod
-    def _build_available_exams(profile):
-        now = timezone.now()
-
-        enrolled_course_ids = list(
-            Enrollment.objects.filter(student=profile)
-            .values_list("course_id", flat=True)
-        )
-        if not enrolled_course_ids:
-            return []
-
-        exams = (
-            Exam.objects.filter(
-                course_id__in=enrolled_course_ids,
-                is_published=True,
-            )
-            .filter(Q(start_time__isnull=True) | Q(start_time__lte=now))
-            .filter(Q(end_time__isnull=True) | Q(end_time__gte=now))
-            .select_related("course")
-            .order_by("end_time", "start_time", "title")
-        )
-
-        attempts = ExamAttempt.objects.filter(
-            student=profile, exam__in=exams
-        ).values("exam_id", "status", "attempt_number")
-
-        by_exam = {}
-        for a in attempts:
-            by_exam.setdefault(a["exam_id"], []).append(a)
-
-        rows = []
-        for e in exams:
-            exam_attempts = by_exam.get(e.id, [])
-            in_progress = any(
-                a["status"] == ExamAttempt.Status.IN_PROGRESS
-                for a in exam_attempts
-            )
-            graded = any(
-                a["status"] == ExamAttempt.Status.GRADED
-                for a in exam_attempts
-            )
-            if graded and not in_progress:
-                continue
-
-            rows.append({
-                "id": e.id,
-                "title": e.title,
-                "course_code": e.course.code if e.course else None,
-                "course_title": e.course.title if e.course else None,
-                "duration_minutes": e.duration_minutes,
-                "total_marks": e.total_marks,
-                "start_time": e.start_time.isoformat() if e.start_time else None,
-                "end_time": e.end_time.isoformat() if e.end_time else None,
-                "status": "in_progress" if in_progress else "not_started",
-                "attempts_count": len(exam_attempts),
-            })
-        return rows
-
-    @staticmethod
-    def _build_in_progress_attempts(attempts_qs):
-        rows = []
-        for a in attempts_qs.filter(
-            status=ExamAttempt.Status.IN_PROGRESS
-        ).select_related("exam", "exam__course").order_by("-start_time"):
-            rows.append({
-                "attempt_id": a.id,
-                "exam_id": a.exam_id,
-                "exam_title": a.exam.title,
-                "course_code": a.exam.course.code if a.exam.course else None,
-                "attempt_number": a.attempt_number,
-                "start_time": a.start_time.isoformat() if a.start_time else None,
-                "duration_minutes": a.exam.duration_minutes,
-                "total_marks": a.exam.total_marks,
-                "answered_count": a.answers.count(),
-                "seconds_remaining": a.seconds_remaining,
-            })
-        return rows
-
-    @staticmethod
-    def _build_exam_performance(attempts_qs):
-        attempts = list(attempts_qs.order_by("-start_time"))
-
-        def _percentage(attempt):
-            total = attempt.exam.total_marks or 0
-            if attempt.score is None or not total:
-                return None
-            try:
-                return round(float(attempt.score) / float(total) * 100, 2)
-            except (TypeError, ValueError, ZeroDivisionError):
-                return None
-
-        def _summary(attempt):
-            if attempt is None:
-                return None
-            return {
-                "attempt_id": attempt.id,
-                "exam_id": attempt.exam_id,
-                "exam_title": attempt.exam.title,
-                "course_code": (
-                    attempt.exam.course.code if attempt.exam.course else None
-                ),
-                "course_title": (
-                    attempt.exam.course.title if attempt.exam.course else None
-                ),
-                "attempt_number": attempt.attempt_number,
-                "status": attempt.status,
-                "score": (
-                    float(attempt.score) if attempt.score is not None else None
-                ),
-                "total_marks": attempt.exam.total_marks,
-                "percentage": _percentage(attempt),
-                "submitted_at": (
-                    attempt.submitted_at.isoformat()
-                    if attempt.submitted_at else None
-                ),
-                "start_time": (
-                    attempt.start_time.isoformat()
-                    if attempt.start_time else None
-                ),
-                "timed_out": attempt.timed_out,
-                "abandoned_at": (
-                    attempt.abandoned_at.isoformat()
-                    if attempt.abandoned_at else None
-                ),
-                "is_flagged": attempt.is_flagged,
-            }
-
-        per_course = {}
-        graded_attempts = []
-        percentages = []
-
-        for a in attempts:
-            pct = _percentage(a)
-            if pct is None:
-                continue
-            graded_attempts.append(a)
-            percentages.append(pct)
-
-            code = a.exam.course.code if a.exam.course else "—"
-            title = a.exam.course.title if a.exam.course else ""
-            bucket = per_course.get(code)
-            if bucket is None:
-                bucket = {
-                    "course_code": code,
-                    "course_title": title,
-                    "attempts": 0,
-                    "total_pct": 0.0,
-                    "best": None,
-                    "worst": None,
-                }
-                per_course[code] = bucket
-            bucket["attempts"] += 1
-            bucket["total_pct"] += pct
-            bucket["best"] = pct if bucket["best"] is None else max(bucket["best"], pct)
-            bucket["worst"] = pct if bucket["worst"] is None else min(bucket["worst"], pct)
-
-        per_course_list = [
-            {
-                "course_code": b["course_code"],
-                "course_title": b["course_title"],
-                "attempts": b["attempts"],
-                "average_percentage": round(b["total_pct"] / b["attempts"], 2),
-                "best_percentage": round(b["best"], 2),
-                "worst_percentage": round(b["worst"], 2),
-            }
-            for b in per_course.values()
+class Course(models.Model):
+    code = models.CharField(max_length=20, unique=True, help_text='e.g. "CS301".')
+    title = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    lecturer = models.ForeignKey(
+        LecturerProfile,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='courses',
+        help_text="Primary instructor. Nullable so course history survives lecturer deletion.",
+    )
+    department = models.CharField(max_length=100, blank=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['code']
+        indexes = [
+            models.Index(fields=['department', 'code']),
         ]
-        per_course_list.sort(key=lambda x: x["course_code"])
 
-        best_attempt = None
-        worst_attempt = None
-        if graded_attempts:
-            best_attempt = max(graded_attempts, key=lambda a: _percentage(a) or 0)
-            worst_attempt = min(graded_attempts, key=lambda a: _percentage(a) or 100)
+    def __str__(self):
+        return f"{self.code} - {self.title}"
 
-        recent_attempts = [_summary(a) for a in attempts[:5]]
 
-        graded_chrono = sorted(
-            graded_attempts,
-            key=lambda a: a.submitted_at or a.start_time,
+class Enrollment(models.Model):
+    student = models.ForeignKey(StudentProfile, on_delete=models.CASCADE, related_name='enrollments')
+    course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='enrollments')
+    semester = models.CharField(max_length=20, blank=True, db_index=True, help_text='e.g. "2024-Fall".')
+    enrolled_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('student', 'course', 'semester')
+        ordering = ['course__code']
+        indexes = [
+            models.Index(fields=['course', 'semester']),
+        ]
+
+    def __str__(self):
+        return f"{self.student} enrolled in {self.course}"
+
+
+# =============================================================================
+# Documents
+# =============================================================================
+
+class DocumentQuerySet(models.QuerySet):
+    def visible_to(self, user):
+        if not user or not user.is_authenticated:
+            return self.none()
+        if user.is_superuser or getattr(user, 'role', None) == User.Role.ADMIN:
+            return self
+        course_ids = (
+            user.student_profile.enrollments.values_list('course_id', flat=True)
+            if hasattr(user, 'student_profile') else []
         )
-        score_trend = {"x": [], "y": [], "text": [], "course_codes": []}
-        for a in graded_chrono:
-            ts = a.submitted_at or a.start_time
-            code = a.exam.course.code if a.exam.course else "—"
-            score_trend["x"].append(ts.isoformat() if ts else None)
-            score_trend["y"].append(_percentage(a))
-            score_trend["course_codes"].append(code)
-            score_trend["text"].append(
-                f"{a.exam.title} (#{a.attempt_number}) — {code}"
+        return self.filter(
+            models.Q(visibility=Document.Visibility.PUBLIC)
+            | models.Q(uploaded_by=user)
+            | models.Q(visibility=Document.Visibility.COURSE, course_id__in=course_ids)
+        )
+
+    def with_uploader(self):
+        return self.select_related('uploaded_by', 'course')
+
+
+class Document(models.Model):
+    class Category(models.TextChoices):
+        NOTE = 'NOTE', 'Note'
+        QUESTION_BANK = 'QUESTION_BANK', 'Question Bank'
+        SOLUTION_BANK = 'SOLUTION_BANK', 'Solution Bank'
+        RESEARCH = 'RESEARCH', 'Research'
+        PROPOSAL = 'PROPOSAL', 'Proposal'
+        OTHER = 'OTHER', 'Other'
+
+    class Visibility(models.TextChoices):
+        PRIVATE = 'PRIVATE', 'Private (only uploader)'
+        COURSE = 'COURSE', 'Course (enrolled students)'
+        PUBLIC = 'PUBLIC', 'Public (all authenticated users)'
+
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    file = models.FileField(
+        upload_to="documents/%Y/%m/%d/",
+        storage=RawMediaCloudinaryStorage(),
+        max_length=500,
+    )
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='uploaded_documents',
+    )
+    course = models.ForeignKey(
+        Course,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='documents',
+    )
+    category = models.CharField(max_length=20, choices=Category.choices, default=Category.OTHER)
+    visibility = models.CharField(
+        max_length=20,
+        choices=Visibility.choices,
+        default=Visibility.COURSE,
+        db_index=True,
+    )
+    content_text = models.TextField(blank=True)
+    content_pages = models.JSONField(
+        null=True, blank=True,
+        help_text="List of {page: int, text: str} extracted per-PDF-page. "
+                  "Used by the correction report so findings can cite exact "
+                  "page numbers. Null for non-PDF uploads or pre-existing rows.",
+    )
+    search_vector = SearchVectorField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = DocumentQuerySet.as_manager()
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['course', 'category']),
+            models.Index(fields=['uploaded_by']),
+            models.Index(fields=['course', 'visibility', 'category']),
+            GinIndex(fields=['search_vector'], name='doc_search_vector_gin'),
+        ]
+
+    def __str__(self):
+        return self.title
+
+    def build_search_vector(self):
+        return (
+            SearchVector('title', weight='A')
+            + SearchVector('description', weight='B')
+            + SearchVector('content_text', weight='C')
+        )
+
+
+@receiver(post_save, sender=Document)
+def sync_document_search_vector(sender, instance, created, update_fields, **kwargs):
+    if update_fields and set(update_fields) == {'search_vector'}:
+        return
+    Document.objects.filter(pk=instance.pk).update(search_vector=instance.build_search_vector())
+
+
+class Highlight(models.Model):
+    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name='highlights')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='highlights')
+    start_offset = models.PositiveIntegerField()
+    end_offset = models.PositiveIntegerField()
+    text = models.TextField()
+    note = models.TextField(blank=True)
+    color = models.CharField(max_length=20, default='yellow')
+    is_ai_generated = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['start_offset']
+        indexes = [
+            models.Index(fields=['document', 'start_offset']),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.end_offset <= self.start_offset:
+            raise ValidationError({'end_offset': 'end_offset must be greater than start_offset.'})
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"Highlight in {self.document.title}"
+
+
+# =============================================================================
+# Question banks, questions, exams
+# =============================================================================
+
+class QuestionBank(models.Model):
+    course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='question_banks')
+    title = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='question_banks')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['course', '-created_at']),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class Question(models.Model):
+    class QuestionType(models.TextChoices):
+        MCQ = 'MCQ', 'Multiple Choice'
+        STRUCTURED = 'STRUCTURED', 'Structured (Essay/Long Answer)'
+
+    bank = models.ForeignKey(QuestionBank, on_delete=models.CASCADE, related_name='questions')
+    question_type = models.CharField(max_length=20, choices=QuestionType.choices, db_index=True)
+    text = models.TextField()
+
+    options = models.JSONField(
+        null=True, blank=True,
+        help_text='List of choice strings. Required for MCQ, must be null otherwise.',
+    )
+    correct_option = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="0-based index into `options` identifying the correct choice. Required for MCQ.",
+    )
+
+    marks = models.PositiveIntegerField(default=1, validators=[MinValueValidator(1)])
+    explanation = models.TextField(blank=True)
+    model_answer = models.TextField(blank=True)
+    rubric = models.JSONField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['id']
+        indexes = [
+            models.Index(fields=['bank', 'question_type']),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.question_type == self.QuestionType.MCQ:
+            if self.options is None or self.correct_option is None:
+                raise ValidationError('MCQ questions require both options and correct_option.')
+            if not isinstance(self.options, list) or len(self.options) < 2:
+                raise ValidationError({'options': 'Options must be a list with at least two choices.'})
+            if self.correct_option < 0 or self.correct_option >= len(self.options):
+                raise ValidationError({'correct_option': 'correct_option index is out of range.'})
+        elif self.question_type == self.QuestionType.STRUCTURED:
+            if self.options is not None or self.correct_option is not None:
+                raise ValidationError('Structured questions must not have options or correct_option.')
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.get_question_type_display()}: {self.text[:50]}"
+
+
+class ExamQuerySet(models.QuerySet):
+    def with_total_marks(self):
+        return self.annotate(
+            total_marks_annotated=Sum(
+                Coalesce(F('exam_questions__marks'), F('exam_questions__question__marks'))
             )
+        )
 
-        per_course_avg = {
-            "x": [c["course_code"] for c in per_course_list],
-            "y": [c["average_percentage"] for c in per_course_list],
-            "text": [c["course_title"] for c in per_course_list],
-        }
+    def upcoming(self):
+        return self.filter(is_published=True, start_time__gte=timezone.now())
 
-        per_course_spread = {
-            "x": [c["course_code"] for c in per_course_list],
-            "best": [c["best_percentage"] for c in per_course_list],
-            "avg": [c["average_percentage"] for c in per_course_list],
-            "worst": [c["worst_percentage"] for c in per_course_list],
-        }
 
-        buckets = {"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
-        for p in percentages:
-            if p >= 80:
-                buckets["A"] += 1
-            elif p >= 70:
-                buckets["B"] += 1
-            elif p >= 60:
-                buckets["C"] += 1
-            elif p >= 50:
-                buckets["D"] += 1
-            else:
-                buckets["F"] += 1
-        grade_distribution = {
-            "labels": ["A (80–100)", "B (70–79)", "C (60–69)", "D (50–59)", "F (<50)"],
-            "values": [
-                buckets["A"], buckets["B"], buckets["C"],
-                buckets["D"], buckets["F"],
-            ],
-        }
+class Exam(models.Model):
+    course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='exams')
+    title = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    instructions = models.TextField(blank=True)
+    duration_minutes = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    start_time = models.DateTimeField(null=True, blank=True, db_index=True)
+    end_time = models.DateTimeField(null=True, blank=True)
+    questions = models.ManyToManyField(
+        Question,
+        through='ExamQuestion',
+        related_name='exams',
+    )
+    is_published = models.BooleanField(default=False, db_index=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='created_exams')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
-        charts = {
-            "score_trend": score_trend,
-            "per_course_avg": per_course_avg,
-            "per_course_spread": per_course_spread,
-            "grade_distribution": grade_distribution,
-        }
+    objects = ExamQuerySet.as_manager()
 
-        return {
-            "attempts_total": len(attempts),
-            "attempts_graded": len(graded_attempts),
-            "average_percentage": (
-                round(sum(percentages) / len(percentages), 2)
-                if percentages else None
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['course', 'is_published']),
+            models.Index(fields=['is_published', 'start_time']),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.start_time and self.end_time and self.end_time <= self.start_time:
+            raise ValidationError({'end_time': 'end_time must be after start_time.'})
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.title
+
+    @property
+    def total_marks(self):
+        result = self.exam_questions.aggregate(
+            total=Sum(Coalesce(F('marks'), F('question__marks')))
+        )
+        return result['total'] or 0
+
+
+class ExamQuestion(models.Model):
+    exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name='exam_questions')
+    question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name='exam_links')
+    order = models.PositiveIntegerField()
+    marks = models.PositiveIntegerField(
+        null=True, blank=True,
+        validators=[MinValueValidator(1)],
+        help_text="Override Question.marks for this exam specifically.",
+    )
+
+    class Meta:
+        ordering = ['order']
+        unique_together = ('exam', 'question')
+        indexes = [
+            models.Index(fields=['exam', 'order']),
+        ]
+
+    def __str__(self):
+        return f"{self.exam.title} - Q{self.order}"
+
+
+# =============================================================================
+# Attempts & answers
+# =============================================================================
+
+class ExamAttempt(models.Model):
+    class Status(models.TextChoices):
+        IN_PROGRESS = 'IN_PROGRESS', 'In Progress'
+        SUBMITTED = 'SUBMITTED', 'Submitted'
+        GRADED = 'GRADED', 'Graded'
+
+    exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name='attempts')
+    student = models.ForeignKey(StudentProfile, on_delete=models.CASCADE, related_name='exam_attempts')
+    attempt_number = models.PositiveSmallIntegerField(default=1)
+    start_time = models.DateTimeField(default=timezone.now)
+    end_time = models.DateTimeField(null=True, blank=True)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.IN_PROGRESS, db_index=True)
+    score = models.DecimalField(
+        max_digits=6, decimal_places=2, null=True, blank=True,
+        validators=[MinValueValidator(0)],
+    )
+    feedback = models.TextField(blank=True)
+
+    last_activity_at = models.DateTimeField(
+        default=timezone.now,
+        db_index=True,
+        help_text="Updated on every save-answer / heartbeat. "
+                  "Stale value ⇒ the student left without submitting.",
+    )
+    timed_out = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="True when the attempt was auto-finalized because the "
+                  "server-side deadline passed (min(start_time + duration, "
+                  "exam.end_time)) without a submit.",
+    )
+    abandoned_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="Set when the student explicitly exited without submitting.",
+    )
+
+    class Meta:
+        ordering = ['-start_time']
+        unique_together = ('exam', 'student', 'attempt_number')
+        indexes = [
+            models.Index(fields=['student', 'status']),
+            models.Index(fields=['exam', 'status']),
+            models.Index(fields=['status', 'last_activity_at']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['exam', 'student'],
+                condition=models.Q(status='IN_PROGRESS'),
+                name='one_in_progress_attempt_per_student',
             ),
-            "best_percentage": max(percentages) if percentages else None,
-            "worst_percentage": min(percentages) if percentages else None,
-            "best_attempt": _summary(best_attempt),
-            "worst_attempt": _summary(worst_attempt),
-            "per_course": per_course_list,
-            "recent_attempts": recent_attempts,
-            "charts": charts,
-        }
+        ]
+
+    def __str__(self):
+        return f"{self.student} - {self.exam.title} (#{self.attempt_number}, {self.status})"
+
+    @property
+    def deadline(self):
+        """
+        The earliest moment the attempt is considered over:
+        min(start_time + duration_minutes, exam.end_time).
+        """
+        from datetime import timedelta
+        cutoff = self.start_time + timedelta(minutes=self.exam.duration_minutes)
+        if self.exam.end_time and self.exam.end_time < cutoff:
+            return self.exam.end_time
+        return cutoff
+
+    @property
+    def seconds_remaining(self):
+        if self.status != self.Status.IN_PROGRESS:
+            return 0
+        delta = (self.deadline - timezone.now()).total_seconds()
+        return max(0, int(delta))
+
+    @property
+    def is_flagged(self):
+        """True when this attempt was not cleanly submitted by the student."""
+        return self.timed_out or self.abandoned_at is not None
+
+
+class Answer(models.Model):
+    attempt = models.ForeignKey(ExamAttempt, on_delete=models.CASCADE, related_name='answers')
+    question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name='answers')
+    selected_option = models.PositiveIntegerField(null=True, blank=True)
+    answer_text = models.TextField(blank=True)
+    score = models.DecimalField(
+        max_digits=6, decimal_places=2, null=True, blank=True,
+        validators=[MinValueValidator(0)],
+    )
+    feedback = models.TextField(blank=True)
+    ai_evaluation = models.JSONField(null=True, blank=True)
+    is_correct = models.BooleanField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['question_id']
+        unique_together = ('attempt', 'question')
+        indexes = [
+            models.Index(fields=['question', 'is_correct']),
+        ]
+
+    def __str__(self):
+        return f"Answer for Q{self.question_id} by {self.attempt.student}"
 
 
 # =============================================================================
-# Lecturer resources
+# Rubrics & research submissions
 # =============================================================================
 
-class CourseViewSet(viewsets.ModelViewSet):
-    serializer_class = CourseSerializer
-    queryset = Course.objects.select_related("lecturer__user")
+class Rubric(models.Model):
+    title = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='rubrics')
+    course = models.ForeignKey(
+        Course, on_delete=models.SET_NULL, null=True, blank=True, related_name='rubrics',
+    )
+    criteria = models.JSONField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
-    def get_permissions(self):
-        if self.request.method in permissions.SAFE_METHODS:
-            return [permissions.IsAuthenticated()]
-        return [permissions.IsAuthenticated(), IsLecturerOrAdmin()]
+    def __str__(self):
+        return self.title
 
-    def get_queryset(self):
-        user = self.request.user
-        if is_admin(user):
-            return self.queryset
-        if is_lecturer(user):
-            return self.queryset.filter(lecturer__user=user)
-        return self.queryset
 
-    def perform_create(self, serializer):
-        user = self.request.user
-        if is_admin(user):
-            serializer.save()
+class ResearchSubmission(models.Model):
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', 'Pending Evaluation'
+        EVALUATED = 'EVALUATED', 'Evaluated'
+        REVIEWED = 'REVIEWED', 'Reviewed by Lecturer'
+
+    student = models.ForeignKey(StudentProfile, on_delete=models.CASCADE, related_name='research_submissions')
+    course = models.ForeignKey(Course, on_delete=models.SET_NULL, null=True, blank=True, related_name='research_submissions')
+    document = models.OneToOneField(
+        Document, on_delete=models.CASCADE, related_name='research_submission',
+    )
+    rubric = models.ForeignKey(Rubric, on_delete=models.SET_NULL, null=True, blank=True)
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    evaluation_status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING, db_index=True)
+    ai_feedback = models.JSONField(null=True, blank=True)
+    overall_score = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+    )
+    lecturer_comments = models.TextField(blank=True)
+
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='approved_submissions',
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-submitted_at']
+        indexes = [
+            models.Index(fields=['student', 'evaluation_status']),
+            models.Index(fields=['course', 'evaluation_status']),
+        ]
+
+    def __str__(self):
+        return f"{self.student} - {self.document.title}"
+
+
+class RubricEvaluation(models.Model):
+    submission = models.ForeignKey(ResearchSubmission, on_delete=models.CASCADE, related_name='evaluations')
+    rubric = models.ForeignKey(Rubric, on_delete=models.PROTECT)
+    scores = models.JSONField()
+    feedback = models.JSONField()
+    overall_score = models.DecimalField(
+        max_digits=5, decimal_places=2,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+    )
+    evaluated_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-evaluated_at']
+        indexes = [
+            models.Index(fields=['submission', '-evaluated_at']),
+        ]
+
+    def __str__(self):
+        return f"Evaluation for {self.submission}"
+
+
+@receiver(post_save, sender=RubricEvaluation)
+def sync_latest_evaluation_to_submission(sender, instance, created, **kwargs):
+    if not created:
+        return
+    ResearchSubmission.objects.filter(pk=instance.submission_id).update(
+        ai_feedback=instance.feedback,
+        overall_score=instance.overall_score,
+        evaluation_status=ResearchSubmission.Status.EVALUATED,
+    )
+
+
+class CorrectionReport(models.Model):
+    """
+    A branded PDF correction report generated from a research submission's
+    latest RubricEvaluation. One row per generated file so historical PDFs
+    survive later re-evaluations.
+    """
+    class Status(models.TextChoices):
+        PENDING    = "PENDING",    "Pending"
+        GENERATING = "GENERATING", "Generating"
+        READY      = "READY",      "Ready"
+        FAILED     = "FAILED",     "Failed"
+
+    submission = models.ForeignKey(
+        ResearchSubmission,
+        on_delete=models.CASCADE,
+        related_name="correction_reports",
+    )
+    evaluation = models.ForeignKey(
+        RubricEvaluation,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="correction_reports",
+        help_text="The evaluation this report was generated from. Nullable "
+                  "so the report survives if the evaluation is later deleted.",
+    )
+    file = models.FileField(
+        upload_to="corrections/%Y/%m/%d/",
+        storage=RawMediaCloudinaryStorage(),
+        max_length=500,
+        null=True, blank=True,
+    )
+    status = models.CharField(
+        max_length=20, choices=Status.choices,
+        default=Status.PENDING, db_index=True,
+    )
+    generated_at = models.DateTimeField(null=True, blank=True)
+    error = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-generated_at", "-id"]
+        indexes = [
+            models.Index(fields=["submission", "-generated_at"]),
+            models.Index(fields=["status"]),
+        ]
+
+    def __str__(self):
+        return f"CorrectionReport#{self.id} for submission {self.submission_id} ({self.status})"
+
+
+# =============================================================================
+# AI usage & billing
+# =============================================================================
+
+class AIServiceConfig(models.Model):
+    """
+    Singleton row (pk=1) holding admin-tunable AI settings.
+
+    Every "override" field is nullable. NULL means "inherit from .env";
+    any non-NULL value means "admin has overridden the env default". The
+    ai_services.resolve_*() helpers implement the fallback chain:
+        DB value (if not NULL) → env value → hardcoded default.
+
+    Fields with no env fallback (feature toggles, token_cost_cents,
+    free_tokens_per_month, allow_pay_as_you_go, max_purchasable_tokens)
+    are pure admin settings — they always come from this row.
+    """
+
+    # ─── Feature gates (no env fallback) ────────────────────────────
+    ai_highlighting_enabled = models.BooleanField(default=True)
+    ai_marking_enabled = models.BooleanField(default=True)
+    ai_research_guidance_enabled = models.BooleanField(default=True)
+
+    # ─── Pricing (no env fallback) ──────────────────────────────────
+    token_cost_cents = models.DecimalField(
+        max_digits=10, decimal_places=6, default=Decimal("0.001000"),
+        validators=[MinValueValidator(0)],
+        help_text=(
+            "Cents per token. 0.001 = 0.00001 UGX per token. "
+            "Realistic for deepseek/deepseek-v4-flash."
+        ),
+    )
+
+    # ─── Free allowance (no env fallback) ───────────────────────────
+    free_tokens_per_month = models.PositiveIntegerField(default=1000)
+    allow_pay_as_you_go = models.BooleanField(default=True)
+    max_purchasable_tokens = models.PositiveIntegerField(null=True, blank=True)
+
+    # ─── Per-feature models (NULL = inherit from env) ───────────────
+    highlight_model = models.CharField(
+        max_length=200, null=True, blank=True,
+        help_text="NULL = inherit from AI_DEFAULT_MODEL. "
+                  "Override example: 'openai/gpt-4o-mini'.",
+    )
+    grading_model = models.CharField(
+        max_length=200, null=True, blank=True,
+        help_text="NULL = inherit from AI_GRADING_MODEL.",
+    )
+    research_model = models.CharField(
+        max_length=200, null=True, blank=True,
+        help_text="NULL = inherit from AI_DEFAULT_MODEL.",
+    )
+
+    # ─── Per-feature token budgets (NULL = inherit from env) ────────
+    highlight_max_tokens = models.PositiveIntegerField(
+        null=True, blank=True,
+        validators=[MinValueValidator(100), MaxValueValidator(8000)],
+        help_text="NULL = inherit from AI_HIGHLIGHT_MAX_TOKENS.",
+    )
+    grading_max_tokens = models.PositiveIntegerField(
+        null=True, blank=True,
+        validators=[MinValueValidator(100), MaxValueValidator(8000)],
+        help_text="NULL = inherit from AI_GRADING_MAX_TOKENS.",
+    )
+    research_max_tokens = models.PositiveIntegerField(
+        null=True, blank=True,
+        validators=[MinValueValidator(100), MaxValueValidator(8000)],
+        help_text="NULL = inherit from AI_RESEARCH_MAX_TOKENS.",
+    )
+
+    # ─── Reliability / sampling (NULL = inherit from env) ───────────
+    repair_attempts = models.PositiveSmallIntegerField(
+        null=True, blank=True,
+        validators=[MaxValueValidator(3)],
+        help_text="NULL = inherit from AI_REPAIR_ATTEMPTS.",
+    )
+    temperature = models.DecimalField(
+        max_digits=3, decimal_places=2, null=True, blank=True,
+        validators=[MinValueValidator(0), MaxValueValidator(2)],
+        help_text="NULL = inherit from AI_TEMPERATURE (or 0.0 if unset).",
+    )
+
+    # ─── Audit ──────────────────────────────────────────────────────
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Who last changed these settings.",
+    )
+
+    class Meta:
+        verbose_name = "AI Service Configuration"
+        verbose_name_plural = "AI Service Configuration"
+
+    def __str__(self):
+        return "AI Service Configuration"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1   # singleton
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise NotImplementedError(
+            "AIServiceConfig is a singleton. Use .load() to access it."
+        )
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
+class UserAICredit(models.Model):
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='ai_credit',
+    )
+    remaining_tokens = models.IntegerField(
+        default=0,
+        # No MinValueValidator — overage from exam grading can make this
+        # negative. That means "user owes N tokens"; try_consume() blocks
+        # future AI calls until the balance is topped up. Negative-balance
+        # entries are only ever written by charge_anyway().
+    )
+    total_purchased_tokens = models.PositiveIntegerField(default=0)
+    last_reset_at = models.DateTimeField(default=timezone.now)
+
+    def __str__(self):
+        return f"Credit for {self.user}"
+
+    def try_consume(self, amount):
+        """
+        Atomic 'charge if sufficient balance'. Returns True if the charge
+        succeeded, False if the balance was too low.
+        """
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        updated = UserAICredit.objects.filter(
+            pk=self.pk, remaining_tokens__gte=amount,
+        ).update(remaining_tokens=F('remaining_tokens') - amount)
+        if updated:
+            self.refresh_from_db(fields=['remaining_tokens'])
+        return bool(updated)
+
+    def charge_anyway(self, amount):
+        """
+        Charge even if the balance goes negative. Used by settle_tokens()
+        for overage on an already-submitted exam answer — we can't un-grade,
+        so we debit and let the balance go negative.
+        """
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        UserAICredit.objects.filter(pk=self.pk).update(
+            remaining_tokens=F('remaining_tokens') - amount,
+        )
+        self.refresh_from_db(fields=['remaining_tokens'])
+
+    def add_tokens(self, amount):
+        """Purchase: adds to balance AND lifetime purchased total."""
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        UserAICredit.objects.filter(pk=self.pk).update(
+            remaining_tokens=F('remaining_tokens') + amount,
+            total_purchased_tokens=F('total_purchased_tokens') + amount,
+        )
+        self.refresh_from_db(fields=['remaining_tokens', 'total_purchased_tokens'])
+
+    def refund_tokens(self, amount):
+        """Reverse a failed AI reservation. Does NOT touch purchase total."""
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        UserAICredit.objects.filter(pk=self.pk).update(
+            remaining_tokens=F('remaining_tokens') + amount,
+        )
+        self.refresh_from_db(fields=['remaining_tokens'])
+
+    def grant_allowance(self, amount):
+        """Monthly free-token grant. Tracked separately from refunds."""
+        if amount <= 0:
             return
+        UserAICredit.objects.filter(pk=self.pk).update(
+            remaining_tokens=F('remaining_tokens') + amount,
+        )
+        self.refresh_from_db(fields=['remaining_tokens'])
 
-        profile = getattr(user, "lecturer_profile", None)
-        if profile is None:
-            raise PermissionDenied(
-                "Only lecturers with a lecturer profile can create courses."
-            )
-        serializer.save(lecturer=profile)
-
-    @action(detail=True, methods=["get"], url_path="available-students")
-    def available_students(self, request, pk=None):
-        if not (is_lecturer(request.user) or is_admin(request.user)):
-            return Response(
-                {"error": "Lecturer or admin access required."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        course = self.get_object()
-
-        qs = StudentProfile.objects.select_related("user").exclude(
-            id__in=Enrollment.objects.filter(course=course).values("student_id")
+    @classmethod
+    def reset_monthly_allowances(cls):
+        """
+        Celery-beat task entry point: top up every user below the free
+        allowance to the allowance. Single SQL UPDATE — no Python loop.
+        """
+        config = AIServiceConfig.load()
+        allowance = config.free_tokens_per_month
+        if not allowance:
+            return 0
+        return cls.objects.filter(
+            remaining_tokens__lt=allowance,
+        ).update(
+            remaining_tokens=allowance,
+            last_reset_at=timezone.now(),
         )
 
-        q = (request.query_params.get("q") or "").strip()
-        if q:
-            qs = qs.filter(
-                Q(student_id__icontains=q)
-                | Q(user__first_name__icontains=q)
-                | Q(user__last_name__icontains=q)
-                | Q(user__username__icontains=q)
-                | Q(user__email__icontains=q)
-            )
 
-        limit = min(parse_positive_int(request.query_params.get("limit")) or 20, 50)
-        qs = qs.order_by("user__first_name", "student_id")[:limit]
+class UserAIUsage(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name='ai_usages',
+    )
+    feature = models.CharField(max_length=50, db_index=True)
+    tokens_used = models.PositiveIntegerField()
+    cost_cents = models.DecimalField(
+        max_digits=10, decimal_places=6, default=Decimal("0"),
+    )
+    related_document = models.ForeignKey(
+        Document, on_delete=models.SET_NULL, null=True, blank=True, related_name='ai_usages',
+    )
+    related_answer = models.ForeignKey(
+        Answer, on_delete=models.SET_NULL, null=True, blank=True, related_name='ai_usages',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
 
-        return Response([
-            {
-                "id": s.id,
-                "student_id": s.student_id,
-                "name": (s.user.get_full_name() or s.user.username).strip(),
-                "email": s.user.email,
-                "department": s.department,
-            }
-            for s in qs
-        ])
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', '-created_at']),
+            models.Index(fields=['feature', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.user} used {self.tokens_used} tokens on {self.feature}"
 
 
-class EnrollmentViewSet(viewsets.ModelViewSet):
-    serializer_class = EnrollmentSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    http_method_names = ["get", "post", "delete", "head", "options"]
-    queryset = Enrollment.objects.select_related(
-        "student__user", "course", "course__lecturer__user"
+class PaymentTransaction(models.Model):
+    """
+    A record of a student's purchase of AI tokens.
+
+    Lifecycle:
+      PENDING  → created by PurchaseTokensView when the order is submitted
+                 to Pesapal. `transaction_id` == `pesapal_merchant_reference`.
+      SUCCESS  → set by mark_successful() when the IPN confirms payment.
+                 Crediting tokens to UserAICredit happens in the same
+                 atomic block, exactly once.
+      FAILED   → set by mark_failed() when Pesapal reports failure or the
+                 order submission itself errored.
+      REFUNDED → reserved for admin-initiated refunds (manual for now).
+
+    The `transaction_id` unique constraint is the ultimate guard against
+    double-crediting even under a race condition. `mark_successful()` also
+    uses `.exclude(status=SUCCESS)` inside a transaction, so re-firing an
+    IPN is completely safe.
+    """
+    class Status(models.TextChoices):
+        PENDING  = 'PENDING',  'Pending'
+        SUCCESS  = 'SUCCESS',  'Success'
+        FAILED   = 'FAILED',   'Failed'
+        REFUNDED = 'REFUNDED', 'Refunded'
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name='payments',
+    )
+    # ── CHANGED: help_text clarified ──────────────────────────
+    # The field stores the smallest unit of the transaction currency.
+    # For UGX (which has no minor unit) that is 1:1 — 5000 = UGX 5,000.
+    # For USD/KES/EUR (which have cents) that is 5000 = 50.00.
+    # The view PurchaseTokensView passes this value straight to Pesapal
+    # as `amount` for UGX, so the semantic must match reality.
+    amount_cents = models.PositiveIntegerField(
+        help_text=(
+            "Amount charged, in the smallest unit of the transaction currency. "
+            "For UGX (no minor unit), 5000 = UGX 5,000. "
+            "For USD/KES/EUR (which have cents), 5000 = 50.00."
+        ),
+    )
+    tokens_purchased = models.PositiveIntegerField()
+    status = models.CharField(
+        max_length=20, choices=Status.choices,
+        default=Status.PENDING, db_index=True,
+    )
+    transaction_id = models.CharField(
+        max_length=255, blank=True, null=True, unique=True,
+        help_text="Public-facing reference. For Pesapal orders this is the "
+                  "same value sent as `merchant_reference`.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    # ─── Pesapal integration fields ────────────────────────────────
+    pesapal_tracking_id = models.CharField(
+        max_length=255, blank=True, null=True, db_index=True,
+        help_text="Pesapal's order_tracking_id. Required to query payment "
+                  "status via GetTransactionStatus.",
+    )
+    pesapal_merchant_reference = models.CharField(
+        max_length=255, blank=True, null=True, db_index=True,
+        help_text="Reference we sent to Pesapal as the order `id`. Usually "
+                  "identical to transaction_id. Kept separate so the field "
+                  "survives if transaction_id is ever reformatted.",
+    )
+    redirect_url = models.URLField(
+        max_length=500, blank=True, null=True,
+        help_text="Pesapal-hosted payment page the student was redirected to.",
+    )
+    raw_pesapal_response = models.JSONField(
+        null=True, blank=True,
+        help_text="Last full response from Pesapal (SubmitOrder or status "
+                  "query). Useful for debugging and audit.",
     )
 
-    def get_queryset(self):
-        user = self.request.user
-        if is_admin(user):
-            qs = self.queryset
-        elif is_lecturer(user):
-            qs = self.queryset.filter(course__lecturer__user=user)
-        elif is_student(user):
-            qs = self.queryset.filter(student__user=user)
-        else:
-            return self.queryset.none()
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', '-created_at']),
+            models.Index(fields=['status']),
+            models.Index(fields=['pesapal_tracking_id']),
+        ]
 
-        course_id = parse_positive_int(self.request.query_params.get("course"))
-        if course_id is not None:
-            qs = qs.filter(course_id=course_id)
+    def __str__(self):
+        return f"Payment {self.id} by {self.user} ({self.status})"
 
-        student_id = parse_positive_int(self.request.query_params.get("student"))
-        if student_id is not None:
-            qs = qs.filter(student_id=student_id)
+    # ─── State transitions ─────────────────────────────────────────
 
-        return qs.order_by("student__user__first_name", "student__student_id")
+    def mark_successful(self):
+        """
+        Atomically transition to SUCCESS and credit tokens exactly once.
 
-    def create(self, request, *args, **kwargs):
-        if is_student(request.user):
-            profile = getattr(request.user, "student_profile", None)
-            if profile is None:
-                return Response(
-                    {"error": "No student profile on this account."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            payload = dict(request.data)
-            course_id = parse_positive_int(payload.get("course_id"))
-            if course_id is None:
-                return Response(
-                    {"error": "course_id is required."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            payload["student_id"] = profile.id
-            serializer = self.get_serializer(data=payload)
-            serializer.is_valid(raise_exception=True)
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-
-        course_id = parse_positive_int(
-            (request.data or {}).get("course_id")
-            or (request.data or {}).get("course")
-        )
-        if course_id is None:
-            return Response(
-                {"error": "course_id is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        course = get_object_or_404(Course, pk=course_id)
-        if not is_admin(request.user):
-            if (course.lecturer is None
-                    or course.lecturer.user_id != request.user.id):
-                return Response(
-                    {"error": "You can only enroll students in your own courses."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-        return super().create(request, *args, **kwargs)
-
-
-class LecturerOwnedViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated, IsLecturerOrAdmin]
-    owner_field = "created_by"
-
-    def get_queryset(self):
-        if is_admin(self.request.user):
-            return self.queryset
-        return self.queryset.filter(**{self.owner_field: self.request.user})
-
-    def perform_create(self, serializer):
-        serializer.save(**{self.owner_field: self.request.user})
-
-
-class QuestionBankViewSet(LecturerOwnedViewSet):
-    serializer_class = QuestionBankSerializer
-    queryset = (
-        QuestionBank.objects
-        .select_related("course", "created_by")
-        .prefetch_related("questions")
-    )
-
-
-class QuestionViewSet(viewsets.ModelViewSet):
-    serializer_class = QuestionSerializer
-    permission_classes = [permissions.IsAuthenticated, IsLecturerOrAdmin]
-    queryset = Question.objects.select_related("bank", "bank__course", "bank__created_by")
-
-    def get_queryset(self):
-        qs = self.queryset
-        user = self.request.user
-        if is_admin(user):
-            qs = qs
-        else:
-            qs = qs.filter(bank__created_by=user)
-
-        bank_id = parse_positive_int(self.request.query_params.get("bank"))
-        if bank_id is not None:
-            qs = qs.filter(bank_id=bank_id)
-        return qs
-
-
-class RubricViewSet(viewsets.ModelViewSet):
-    serializer_class = RubricSerializer
-    queryset = Rubric.objects.select_related("course", "created_by")
-
-    def get_permissions(self):
-        if self.request.method in permissions.SAFE_METHODS:
-            return [permissions.IsAuthenticated()]
-        return [permissions.IsAuthenticated(), IsLecturerOrAdmin()]
-
-    def get_queryset(self):
-        user = self.request.user
-        if is_admin(user):
-            return self.queryset
-        if is_lecturer(user):
-            return self.queryset.filter(created_by=user)
-
-        profile = getattr(user, "student_profile", None)
-        if profile is None:
-            return self.queryset.none()
-        course_ids = profile.enrollments.values_list("course_id", flat=True)
-        return self.queryset.filter(course_id__in=course_ids)
-
-    def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
-
-
-class ExamViewSet(viewsets.ModelViewSet):
-    serializer_class = ExamSerializer
-    permission_classes = [permissions.IsAuthenticated, IsLecturerOrAdmin]
-    queryset = (
-        Exam.objects
-        .select_related("course", "created_by")
-        .prefetch_related("exam_questions__question")
-    )
-
-    def get_queryset(self):
-        qs = self.queryset.with_total_marks()
-        if is_admin(self.request.user):
-            return qs
-        return qs.filter(course__lecturer__user=self.request.user)
-
-    def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
-
-
-class ExamQuestionViewSet(viewsets.ModelViewSet):
-    serializer_class = ExamQuestionSerializer
-    permission_classes = [permissions.IsAuthenticated, IsLecturerOrAdmin]
-    queryset = ExamQuestion.objects.select_related(
-        "exam", "exam__course", "exam__course__lecturer__user", "question"
-    )
-
-    def get_queryset(self):
-        qs = self.queryset
-        user = self.request.user
-        if is_admin(user):
-            pass
-        else:
-            qs = qs.filter(exam__course__lecturer__user=user)
-
-        exam_id = parse_positive_int(self.request.query_params.get("exam"))
-        if exam_id is not None:
-            qs = qs.filter(exam_id=exam_id)
-
-        return qs.order_by("exam_id", "order")
-
-    def perform_create(self, serializer):
-        exam = serializer.validated_data.get("exam")
-        if not is_admin(self.request.user):
-            if (exam is None
-                    or exam.course is None
-                    or exam.course.lecturer is None
-                    or exam.course.lecturer.user_id != self.request.user.id):
-                raise PermissionDenied(
-                    "You can only add questions to exams you own."
-                )
-        serializer.save()
-
-
-# =============================================================================
-# Research submissions
-# =============================================================================
-
-class ResearchSubmissionViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated]
-    queryset = ResearchSubmission.objects.select_related(
-        "student__user", "document", "rubric", "course", "approved_by"
-    )
-    http_method_names = ["get", "post", "head", "options"]
-
-    def get_serializer_class(self):
-        if self.action == "create":
-            return ResearchSubmissionCreateSerializer
-        if self.action == "roster":
-            return SubmissionRosterSerializer
-        if self.action == "approve":
-            return ResearchSubmissionApproveSerializer
-        return ResearchSubmissionSerializer
-
-    def get_serializer_context(self):
-        ctx = super().get_serializer_context()
-        ctx["request"] = self.request
-        return ctx
-
-    def get_queryset(self):
-        qs = self.queryset
-        user = self.request.user
-
-        if is_admin(user):
-            return qs
-
-        if is_lecturer(user):
-            return qs.filter(
-                Q(course__lecturer__user=user)
-                | Q(rubric__created_by=user)
-            ).distinct()
-
-        if is_student(user):
-            return qs.filter(student__user=user)
-
-        return qs.none()
-
-    def create(self, request, *args, **kwargs):
-        if not is_student(request.user):
-            return Response(
-                {"error": "Only students can create research submissions."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        response = super().create(request, *args, **kwargs)
-
-        try:
-            submission_id = (response.data or {}).get("id")
-            if submission_id:
-                transaction.on_commit(
-                    lambda sid=submission_id: kick_off_evaluation(sid)
-                )
-        except Exception:
-            logger.exception("Could not schedule auto-evaluation")
-
-        return response
-
-    @action(detail=False, methods=["get"], url_path="roster")
-    def roster(self, request):
-        if not (is_lecturer(request.user) or is_admin(request.user)):
-            return Response(
-                {"error": "Lecturer access required."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        course_id = parse_positive_int(request.query_params.get("course_id"))
-        qs = self.get_queryset()
-        if course_id is not None:
-            qs = qs.filter(course_id=course_id)
-
-        qs = qs.order_by("-submitted_at")
-        rows = SubmissionRosterSerializer(qs, many=True).data
-
-        counts = {
-            "total": len(rows),
-            "pending": sum(1 for r in rows if r["evaluation_status"] == "PENDING"),
-            "evaluated": sum(1 for r in rows if r["evaluation_status"] == "EVALUATED"),
-            "reviewed": sum(1 for r in rows if r["evaluation_status"] == "REVIEWED"),
-        }
-        return Response({"counts": counts, "results": rows})
-
-    @action(detail=True, methods=["post"], url_path="approve")
-    def approve(self, request, pk=None):
-        submission = self.get_object()
-        user = request.user
-
-        if not is_admin(user):
-            is_course_lecturer = (
-                submission.course is not None
-                and submission.course.lecturer is not None
-                and submission.course.lecturer.user_id == user.id
-            )
-            is_rubric_author = (
-                submission.rubric is not None
-                and submission.rubric.created_by_id == user.id
-            )
-            if not (is_course_lecturer or is_rubric_author):
-                return Response(
-                    {"error": "Only the course lecturer or the rubric author "
-                              "can approve this submission."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-
-        serializer = self.get_serializer(
-            data=request.data,
-            context={"request": request, "submission": submission},
-        )
-        serializer.is_valid(raise_exception=True)
-
-        comments = serializer.validated_data.get("lecturer_comments")
-
+        Safe against double-firing: the .exclude(status=SUCCESS) filter
+        means a second call is a no-op. Token credit happens inside the
+        same transaction, so either both writes land or neither does.
+        """
         with transaction.atomic():
-            submission.evaluation_status = ResearchSubmission.Status.REVIEWED
-            submission.approved_by = user
-            submission.approved_at = timezone.now()
-            update_fields = [
-                "evaluation_status", "approved_by", "approved_at",
-            ]
-            if comments is not None:
-                submission.lecturer_comments = comments
-                update_fields.append("lecturer_comments")
-            submission.save(update_fields=update_fields)
-
-        return Response(
-            ResearchSubmissionSerializer(submission, context={"request": request}).data,
-            status=status.HTTP_200_OK,
-        )
-
-    @action(detail=True, methods=["post"], url_path="unapprove")
-    def unapprove(self, request, pk=None):
-        submission = self.get_object()
-        user = request.user
-
-        if not is_admin(user):
-            is_course_lecturer = (
-                submission.course is not None
-                and submission.course.lecturer is not None
-                and submission.course.lecturer.user_id == user.id
-            )
-            is_rubric_author = (
-                submission.rubric is not None
-                and submission.rubric.created_by_id == user.id
-            )
-            if not (is_course_lecturer or is_rubric_author):
-                return Response(
-                    {"error": "Only the course lecturer or the rubric "
-                              "author can revert this submission."},
-                    status=status.HTTP_403_FORBIDDEN,
+            updated = (
+                PaymentTransaction.objects
+                .filter(pk=self.pk)
+                .exclude(status=PaymentTransaction.Status.SUCCESS)
+                .update(
+                    status=PaymentTransaction.Status.SUCCESS,
+                    completed_at=timezone.now(),
                 )
-
-        if submission.evaluation_status != ResearchSubmission.Status.REVIEWED:
-            return Response(
-                {"error": "Only a reviewed submission can be reverted. "
-                          f"Current status: {submission.evaluation_status}."},
-                status=status.HTTP_400_BAD_REQUEST,
             )
+            if not updated:
+                return False
+            credit, _ = UserAICredit.objects.get_or_create(user_id=self.user_id)
+            credit.add_tokens(self.tokens_purchased)
 
+        self.refresh_from_db(fields=['status', 'completed_at'])
+        return True
+
+    def mark_failed(self, reason: str = ""):
+        """
+        Transition to FAILED. Same idempotency guard as mark_successful():
+        a SUCCESS row is never downgraded by a late/duplicate IPN.
+        """
         with transaction.atomic():
-            submission.evaluation_status = ResearchSubmission.Status.EVALUATED
-            submission.approved_by = None
-            submission.approved_at = None
-            submission.save(update_fields=[
-                "evaluation_status", "approved_by", "approved_at",
-            ])
-
-        return Response(
-            ResearchSubmissionSerializer(
-                submission, context={"request": request}
-            ).data,
-            status=status.HTTP_200_OK,
-        )
-
-    @action(detail=True, methods=["post"], url_path="comments")
-    def comments(self, request, pk=None):
-        submission = self.get_object()
-        user = request.user
-
-        if not is_admin(user):
-            is_course_lecturer = (
-                submission.course is not None
-                and submission.course.lecturer is not None
-                and submission.course.lecturer.user_id == user.id
+            updated = (
+                PaymentTransaction.objects
+                .filter(pk=self.pk)
+                .exclude(status__in=[
+                    PaymentTransaction.Status.SUCCESS,
+                    PaymentTransaction.Status.REFUNDED,
+                ])
+                .update(status=PaymentTransaction.Status.FAILED)
             )
-            is_rubric_author = (
-                submission.rubric is not None
-                and submission.rubric.created_by_id == user.id
-            )
-            if not (is_course_lecturer or is_rubric_author):
-                return Response(
-                    {"error": "Only the course lecturer or the rubric "
-                              "author can edit comments."},
-                    status=status.HTTP_403_FORBIDDEN,
+        if updated:
+            self.refresh_from_db(fields=['status'])
+            if reason:
+                logger.info(
+                    "PaymentTransaction %s marked FAILED: %s", self.pk, reason,
                 )
+        return bool(updated)
 
-        text = (request.data or {}).get("lecturer_comments", "")
-        submission.lecturer_comments = text
-        submission.save(update_fields=["lecturer_comments"])
+    @property
+    def is_pesapal_order(self) -> bool:
+        """True if this payment was submitted to Pesapal (vs simulated)."""
+        return bool(self.pesapal_tracking_id or self.pesapal_merchant_reference)
 
-        return Response(
-            ResearchSubmissionSerializer(
-                submission, context={"request": request}
-            ).data,
-            status=status.HTTP_200_OK,
-        )
 
-    @action(detail=True, methods=["post"], url_path="retry-eval")
-    def retry_eval(self, request, pk=None):
-        submission = self.get_object()
+class AIPurchasePackage(models.Model):
+    name = models.CharField(max_length=100)
+    tokens = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    price_cents = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
-        if submission.evaluation_status == ResearchSubmission.Status.REVIEWED:
-            return Response(
-                {"error": "Already reviewed — no need to re-evaluate."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+    class Meta:
+        ordering = ['price_cents']
 
-        if not submission.rubric_id:
-            return Response(
-                {"error": "No rubric attached. Attach one before retrying."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if not submission.document.content_text:
-            return Response(
-                {"error": "No text extracted from the document. Re-upload the file."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        submission.evaluation_status = ResearchSubmission.Status.PENDING
-        submission.save(update_fields=["evaluation_status"])
-
-        kick_off_evaluation(submission.id)
-
-        return Response(
-            {
-                "status": "queued",
-                "submission_id": submission.id,
-                "message": "Evaluation started. Refresh in ~30 s.",
-            },
-            status=status.HTTP_202_ACCEPTED,
-        )
-
-    @action(detail=True, methods=["post"], url_path="correction")
-    def correction(self, request, pk=None):
-        submission = self.get_object()
-
-        if not submission.evaluations.exists():
-            return Response(
-                {"error": "Submission has not been evaluated yet. "
-                          "Run an AI evaluation before requesting a report."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        existing = (
-            CorrectionReport.objects
-            .filter(submission=submission, status=CorrectionReport.Status.READY)
-            .order_by("-generated_at")
-            .first()
-        )
-        if existing:
-            return Response(
-                CorrectionReportSerializer(existing, context={"request": request}).data,
-                status=status.HTTP_200_OK,
-            )
-
-        inflight = (
-            CorrectionReport.objects
-            .filter(submission=submission,
-                    status__in=[CorrectionReport.Status.PENDING,
-                                CorrectionReport.Status.GENERATING])
-            .order_by("-id")
-            .first()
-        )
-        if inflight:
-            return Response(
-                CorrectionReportSerializer(inflight, context={"request": request}).data,
-                status=status.HTTP_202_ACCEPTED,
-            )
-
-        evaluation = submission.evaluations.order_by("-evaluated_at").first()
-        report = CorrectionReport.objects.create(
-            submission=submission,
-            evaluation=evaluation,
-            status=CorrectionReport.Status.PENDING,
-        )
-
-        mode, payload = dispatch(
-            generate_correction_report_task, [report.id], request.user,
-            dedupe_key=f"ai:inflight:correction:{report.id}",
-        )
-
-        if mode == "sync":
-            report.refresh_from_db()
-            code = (status.HTTP_200_OK if report.status == CorrectionReport.Status.READY
-                    else status.HTTP_500_INTERNAL_SERVER_ERROR)
-            return Response(
-                CorrectionReportSerializer(report, context={"request": request}).data,
-                status=code,
-            )
-        if mode == "async":
-            return Response(
-                {
-                    "report_id": report.id,
-                    "task_id": payload,
-                    "status": report.status,
-                },
-                status=status.HTTP_202_ACCEPTED,
-            )
-        return task_error_response(payload)
-
-    @action(detail=True, methods=["get"], url_path="correction/status")
-    def correction_status(self, request, pk=None):
-        submission = self.get_object()
-        report = (
-            CorrectionReport.objects
-            .filter(submission=submission)
-            .order_by("-id")
-            .first()
-        )
-        if not report:
-            return Response(
-                {"error": "No correction report has been requested yet."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-        return Response(
-            CorrectionReportSerializer(report, context={"request": request}).data,
-            status=status.HTTP_200_OK,
-        )
-
-
-# =============================================================================
-# Exam attempts & answers
-# =============================================================================
-
-class ExamAttemptViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated]
-    http_method_names = ["get", "post", "head", "options"]
-    queryset = ExamAttempt.objects.select_related(
-        "exam", "exam__course", "student__user"
-    ).prefetch_related("answers__question")
-
-    def get_serializer_class(self):
-        if self.action == "start":
-            return ExamAttemptStartSerializer
-        if self.action == "save_answer":
-            return AnswerUpsertSerializer
-        if is_lecturer(self.request.user) or is_admin(self.request.user):
-            return ExamAttemptForLecturerSerializer
-        return ExamAttemptDetailSerializer
-
-    def get_queryset(self):
-        qs = self.queryset
-        user = self.request.user
-        if is_admin(user):
-            return qs
-        if is_lecturer(user):
-            return qs.filter(exam__course__lecturer__user=user)
-        if is_student(user):
-            return qs.filter(student__user=user)
-        return qs.none()
-
-    @action(detail=False, methods=["post"], url_path="start")
-    def start(self, request):
-        if not is_student(request.user):
-            return Response(
-                {"error": "Only students can start exam attempts."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        ser = ExamAttemptStartSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        exam_id = ser.validated_data["exam_id"]
-
-        exam = get_object_or_404(Exam, pk=exam_id)
-
-        if not exam.is_published and not is_admin(request.user):
-            return Response(
-                {"error": "This exam is not published."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        now = timezone.now()
-        if exam.start_time and now < exam.start_time:
-            return Response(
-                {"error": "This exam has not started yet."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-        if exam.end_time and now > exam.end_time:
-            return Response(
-                {"error": "This exam has already closed."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        profile = request.user.student_profile
-
-        if not is_admin(request.user):
-            if not Enrollment.objects.filter(
-                student=profile, course=exam.course
-            ).exists():
-                return Response(
-                    {"error": "You are not enrolled in this course."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-
-        with transaction.atomic():
-            existing = ExamAttempt.objects.select_for_update().filter(
-                exam=exam, student=profile,
-                status=ExamAttempt.Status.IN_PROGRESS,
-            ).first()
-            if existing:
-                if existing.deadline <= now:
-                    expire_attempt(existing.id, reason="timed_out")
-                    existing = None
-                else:
-                    return Response(
-                        ExamAttemptDetailSerializer(existing).data,
-                        status=status.HTTP_200_OK,
-                    )
-
-            last = ExamAttempt.objects.filter(
-                exam=exam, student=profile
-            ).order_by("-attempt_number").first()
-            next_number = (last.attempt_number + 1) if last else 1
-
-            try:
-                attempt = ExamAttempt.objects.create(
-                    exam=exam,
-                    student=profile,
-                    attempt_number=next_number,
-                    status=ExamAttempt.Status.IN_PROGRESS,
-                )
-            except IntegrityError:
-                attempt = ExamAttempt.objects.filter(
-                    exam=exam, student=profile,
-                    status=ExamAttempt.Status.IN_PROGRESS,
-                ).first()
-                if attempt is None:
-                    return Response(
-                        {"error": "Could not start attempt. Please retry."},
-                        status=status.HTTP_409_CONFLICT,
-                    )
-                return Response(
-                    ExamAttemptDetailSerializer(attempt).data,
-                    status=status.HTTP_200_OK,
-                )
-
-        return Response(
-            ExamAttemptDetailSerializer(attempt).data,
-            status=status.HTTP_201_CREATED,
-        )
-
-    @action(detail=True, methods=["post"], url_path="save-answer")
-    def save_answer(self, request, pk=None):
-        attempt = self.get_object()
-
-        if (attempt.status == ExamAttempt.Status.IN_PROGRESS
-                and attempt.deadline <= timezone.now()):
-            expire_attempt(attempt.id, reason="timed_out")
-            attempt.refresh_from_db()
-            return Response(
-                {
-                    "error": "Time is up. The exam was automatically submitted.",
-                    "status": attempt.status,
-                    "timed_out": True,
-                },
-                status=status.HTTP_410_GONE,
-            )
-
-        if attempt.status != ExamAttempt.Status.IN_PROGRESS:
-            return Response(
-                {
-                    "error": "This attempt is no longer editable.",
-                    "status": attempt.status,
-                    "timed_out": attempt.timed_out,
-                    "abandoned_at": (
-                        attempt.abandoned_at.isoformat()
-                        if attempt.abandoned_at else None
-                    ),
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        ser = AnswerUpsertSerializer(
-            data=request.data, context={"attempt": attempt}
-        )
-        ser.is_valid(raise_exception=True)
-
-        with transaction.atomic():
-            answer, created = Answer.objects.update_or_create(
-                attempt=attempt,
-                question=ser.validated_data["question"],
-                defaults={
-                    "selected_option": ser.validated_data.get("selected_option"),
-                    "answer_text": ser.validated_data.get("answer_text", ""),
-                },
-            )
-            ExamAttempt.objects.filter(pk=attempt.pk).update(
-                last_activity_at=timezone.now()
-            )
-
-        return Response(
-            AnswerDetailSerializer(answer).data,
-            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
-        )
-
-    @action(detail=True, methods=["post"], url_path="heartbeat")
-    def heartbeat(self, request, pk=None):
-        attempt = self.get_object()
-
-        if attempt.status != ExamAttempt.Status.IN_PROGRESS:
-            return Response(
-                {
-                    "status": attempt.status,
-                    "seconds_remaining": 0,
-                    "timed_out": attempt.timed_out,
-                },
-                status=status.HTTP_200_OK,
-            )
-
-        if attempt.deadline <= timezone.now():
-            expire_attempt(attempt.id, reason="timed_out")
-            attempt.refresh_from_db()
-            return Response(
-                {
-                    "status": attempt.status,
-                    "seconds_remaining": 0,
-                    "timed_out": True,
-                    "message": "Time is up. The exam was automatically submitted.",
-                },
-                status=status.HTTP_410_GONE,
-            )
-
-        ExamAttempt.objects.filter(pk=attempt.pk).update(
-            last_activity_at=timezone.now()
-        )
-        return Response({
-            "status": attempt.status,
-            "seconds_remaining": attempt.seconds_remaining,
-            "timed_out": False,
-        })
-
-    @action(detail=True, methods=["post"], url_path="abandon")
-    def abandon(self, request, pk=None):
-        attempt = self.get_object()
-
-        if attempt.status != ExamAttempt.Status.IN_PROGRESS:
-            return Response(
-                {
-                    "status": attempt.status,
-                    "abandoned_at": (
-                        attempt.abandoned_at.isoformat()
-                        if attempt.abandoned_at else None
-                    ),
-                    "timed_out": attempt.timed_out,
-                    "already_finalized": True,
-                },
-                status=status.HTTP_200_OK,
-            )
-
-        result = expire_attempt(attempt.id, reason="abandoned")
-        return Response(result, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=["post"], url_path="submit")
-    def submit(self, request, pk=None):
-        attempts = ExamAttempt.objects.select_related("exam", "student__user")
-        if not is_admin(request.user):
-            attempts = attempts.filter(student__user=request.user)
-
-        with transaction.atomic():
-            attempt = get_object_or_404(
-                attempts.select_for_update(of=("self",)), pk=pk
-            )
-            prepare_result = _perform_exam_submit_prepare(attempt)
-
-        if isinstance(prepare_result, Response):
-            return prepare_result
-
-        return _perform_exam_submit_grade(request, prepare_result)
-
-
-# =============================================================================
-# Lecturer analytics
-# =============================================================================
-
-class LecturerExamAnalyticsView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request, pk):
-        exam = get_object_or_404(
-            Exam.objects.select_related("course", "course__lecturer__user"),
-            pk=pk,
-        )
-
-        if not is_admin(request.user):
-            if not (is_lecturer(request.user)
-                    and exam.course
-                    and exam.course.lecturer
-                    and exam.course.lecturer.user_id == request.user.id):
-                return Response(
-                    {"error": "Only the course lecturer can view this."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-
-        total_marks = exam.total_marks or 0
-
-        attempts = list(
-            ExamAttempt.objects
-            .filter(exam=exam)
-            .select_related("student__user")
-            .order_by("student_id", "-attempt_number")
-        )
-
-        best_by_student = {}
-        for a in attempts:
-            if a.score is None or not total_marks:
-                continue
-            pct = round(float(a.score) / total_marks * 100, 2)
-            current = best_by_student.get(a.student_id)
-            if current is None or pct > current["percentage"]:
-                best_by_student[a.student_id] = {
-                    "student_id": a.student.student_id,
-                    "name": (a.student.user.get_full_name()
-                             or a.student.user.username),
-                    "percentage": pct,
-                    "score": float(a.score),
-                    "attempt_number": a.attempt_number,
-                    "timed_out": a.timed_out,
-                    "abandoned": a.abandoned_at is not None,
-                    "is_flagged": a.is_flagged,
-                }
-
-        student_rows = sorted(
-            best_by_student.values(),
-            key=lambda r: r["percentage"],
-            reverse=True,
-        )
-
-        percentages = [r["percentage"] for r in student_rows]
-
-        def _median(vals):
-            if not vals:
-                return None
-            s = sorted(vals)
-            n = len(s)
-            mid = n // 2
-            return (s[mid] if n % 2 else round((s[mid - 1] + s[mid]) / 2, 2))
-
-        passes = sum(1 for p in percentages if p >= 50)
-        summary = {
-            "exam_id": exam.id,
-            "exam_title": exam.title,
-            "course_code": exam.course.code if exam.course else None,
-            "total_marks": total_marks,
-            "attempts_total": len(attempts),
-            "attempts_in_progress": sum(
-                1 for a in attempts if a.status == ExamAttempt.Status.IN_PROGRESS
-            ),
-            "attempts_submitted": sum(
-                1 for a in attempts if a.status == ExamAttempt.Status.SUBMITTED
-            ),
-            "attempts_graded": sum(
-                1 for a in attempts if a.status == ExamAttempt.Status.GRADED
-            ),
-            "attempts_timed_out": sum(1 for a in attempts if a.timed_out),
-            "attempts_abandoned": sum(
-                1 for a in attempts if a.abandoned_at is not None
-            ),
-            "attempts_flagged": sum(1 for a in attempts if a.is_flagged),
-            "students_count": len(student_rows),
-            "average_percentage": (
-                round(sum(percentages) / len(percentages), 2)
-                if percentages else None
-            ),
-            "median_percentage": _median(percentages),
-            "best_percentage": max(percentages) if percentages else None,
-            "worst_percentage": min(percentages) if percentages else None,
-            "pass_rate": (
-                round(passes / len(percentages) * 100, 2)
-                if percentages else None
-            ),
-            "passes": passes,
-            "failures": len(percentages) - passes,
-        }
-
-        eqs = list(
-            exam.exam_questions.select_related("question").order_by("order")
-        )
-        difficulty = []
-        for eq in eqs:
-            q = eq.question
-            answers = Answer.objects.filter(
-                attempt__exam=exam, question=q,
-                attempt__status=ExamAttempt.Status.GRADED,
-            )
-            total_scored = answers.count()
-            correct = answers.filter(is_correct=True).count()
-            avg_score = answers.aggregate(avg=Avg("score"))["avg"]
-            max_possible = eq.marks or q.marks or 1
-            difficulty.append({
-                "question_id": q.id,
-                "order": eq.order,
-                "question_type": q.question_type,
-                "text": (q.text[:80] + "…") if len(q.text) > 80 else q.text,
-                "answered": total_scored,
-                "correct": correct,
-                "correct_rate": (
-                    round(correct / total_scored * 100, 2)
-                    if total_scored else None
-                ),
-                "average_score": (
-                    round(float(avg_score), 2) if avg_score is not None else None
-                ),
-                "max_score": max_possible,
-            })
-
-        bins = [0] * 10
-        for p in percentages:
-            idx = min(9, int(p // 10))
-            bins[idx] += 1
-
-        score_histogram = {
-            "x": [f"{i*10}–{i*10+9}%" for i in range(10)],
-            "y": bins,
-        }
-
-        ranked = {
-            "x": [r["name"] for r in student_rows],
-            "y": [r["percentage"] for r in student_rows],
-            "labels": [r["student_id"] for r in student_rows],
-        }
-
-        q_difficulty = {
-            "x": [f"Q{d['order']}" for d in difficulty],
-            "y": [d["correct_rate"] for d in difficulty],
-            "text": [d["text"] for d in difficulty],
-        }
-
-        bands = {"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
-        for p in percentages:
-            band = _grade_band(p)
-            if band:
-                bands[band] += 1
-        grade_distribution = {
-            "labels": ["A (80–100)", "B (70–79)", "C (60–69)", "D (50–59)", "F (<50)"],
-            "values": [bands["A"], bands["B"], bands["C"], bands["D"], bands["F"]],
-        }
-
-        status_breakdown = {
-            "labels": ["In progress", "Submitted", "Graded"],
-            "values": [
-                summary["attempts_in_progress"],
-                summary["attempts_submitted"],
-                summary["attempts_graded"],
-            ],
-        }
-
-        charts = {
-            "score_histogram": score_histogram,
-            "ranked_students": ranked,
-            "question_difficulty": q_difficulty,
-            "grade_distribution": grade_distribution,
-            "status_breakdown": status_breakdown,
-        }
-
-        return Response({
-            "summary": summary,
-            "students": student_rows,
-            "questions": difficulty,
-            "charts": charts,
-        })
-
-
-class LecturerCourseAnalyticsView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request, pk):
-        course = get_object_or_404(
-            Course.objects.select_related("lecturer__user"), pk=pk
-        )
-
-        if not is_admin(request.user):
-            if not (is_lecturer(request.user)
-                    and course.lecturer
-                    and course.lecturer.user_id == request.user.id):
-                return Response(
-                    {"error": "Only the course lecturer can view this."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-
-        exams = list(course.exams.order_by("id"))
-        exam_ids = [e.id for e in exams]
-
-        attempts = list(
-            ExamAttempt.objects
-            .filter(exam_id__in=exam_ids)
-            .select_related("exam", "student__user")
-            .order_by("submitted_at")
-        )
-
-        per_exam = {}
-        for e in exams:
-            per_exam[e.id] = {
-                "exam_id": e.id,
-                "exam_title": e.title,
-                "total_marks": e.total_marks or 0,
-                "attempts": 0,
-                "graded": 0,
-                "total_pct": 0.0,
-                "best": None,
-                "worst": None,
-            }
-
-        per_student = {}
-        trend_points = []
-
-        for a in attempts:
-            total = a.exam.total_marks or 0
-            pct = (
-                round(float(a.score) / total * 100, 2)
-                if a.score is not None and total else None
-            )
-
-            bucket = per_exam[a.exam_id]
-            bucket["attempts"] += 1
-            if pct is not None:
-                bucket["graded"] += 1
-                bucket["total_pct"] += pct
-                bucket["best"] = pct if bucket["best"] is None else max(bucket["best"], pct)
-                bucket["worst"] = pct if bucket["worst"] is None else min(bucket["worst"], pct)
-
-                key = a.student_id
-                row = per_student.get(key)
-                if row is None:
-                    row = {
-                        "student_id": a.student.student_id,
-                        "name": (a.student.user.get_full_name()
-                                 or a.student.user.username),
-                        "attempts": 0,
-                        "total_pct": 0.0,
-                        "best": None,
-                        "worst": None,
-                    }
-                    per_student[key] = row
-                row["attempts"] += 1
-                row["total_pct"] += pct
-                row["best"] = pct if row["best"] is None else max(row["best"], pct)
-                row["worst"] = pct if row["worst"] is None else min(row["worst"], pct)
-
-                trend_points.append({
-                    "x": (a.submitted_at or a.start_time).isoformat(),
-                    "y": pct,
-                    "exam_title": a.exam.title,
-                    "student": a.student.student_id,
-                })
-
-        per_exam_list = []
-        for b in per_exam.values():
-            per_exam_list.append({
-                "exam_id": b["exam_id"],
-                "exam_title": b["exam_title"],
-                "attempts": b["attempts"],
-                "graded": b["graded"],
-                "average_percentage": (
-                    round(b["total_pct"] / b["graded"], 2)
-                    if b["graded"] else None
-                ),
-                "best_percentage": b["best"],
-                "worst_percentage": b["worst"],
-            })
-
-        per_student_list = sorted(
-            [
-                {
-                    "student_id": r["student_id"],
-                    "name": r["name"],
-                    "attempts": r["attempts"],
-                    "average_percentage": round(r["total_pct"] / r["attempts"], 2),
-                    "best_percentage": r["best"],
-                    "worst_percentage": r["worst"],
-                }
-                for r in per_student.values()
-            ],
-            key=lambda r: r["average_percentage"],
-            reverse=True,
-        )
-
-        all_pcts = [p["y"] for p in trend_points]
-        passes = sum(1 for p in all_pcts if p >= 50)
-        summary = {
-            "course_id": course.id,
-            "course_code": course.code,
-            "course_title": course.title,
-            "exams_count": len(exams),
-            "attempts_total": len(attempts),
-            "students_count": len(per_student_list),
-            "average_percentage": (
-                round(sum(all_pcts) / len(all_pcts), 2)
-                if all_pcts else None
-            ),
-            "best_percentage": max(all_pcts) if all_pcts else None,
-            "worst_percentage": min(all_pcts) if all_pcts else None,
-            "pass_rate": (
-                round(passes / len(all_pcts) * 100, 2) if all_pcts else None
-            ),
-        }
-
-        avg_per_exam = {
-            "x": [e["exam_title"] for e in per_exam_list],
-            "y": [
-                e["average_percentage"] if e["average_percentage"] is not None else 0
-                for e in per_exam_list
-            ],
-            "text": [e["exam_title"] for e in per_exam_list],
-        }
-
-        score_trend = {
-            "x": [p["x"] for p in trend_points],
-            "y": [p["y"] for p in trend_points],
-            "text": [
-                f"{p['exam_title']} — {p['student']}" for p in trend_points
-            ],
-        }
-
-        student_avg = {
-            "x": [s["name"] for s in per_student_list],
-            "y": [s["average_percentage"] for s in per_student_list],
-            "labels": [s["student_id"] for s in per_student_list],
-        }
-
-        bands = {"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
-        for p in all_pcts:
-            band = _grade_band(p)
-            if band:
-                bands[band] += 1
-        grade_distribution = {
-            "labels": ["A (80–100)", "B (70–79)", "C (60–69)", "D (50–59)", "F (<50)"],
-            "values": [bands["A"], bands["B"], bands["C"], bands["D"], bands["F"]],
-        }
-
-        attempts_per_exam = {
-            "x": [e["exam_title"] for e in per_exam_list],
-            "y": [e["attempts"] for e in per_exam_list],
-        }
-
-        charts = {
-            "avg_per_exam": avg_per_exam,
-            "score_trend": score_trend,
-            "student_avg": student_avg,
-            "grade_distribution": grade_distribution,
-            "attempts_per_exam": attempts_per_exam,
-        }
-
-        return Response({
-            "summary": summary,
-            "exams": per_exam_list,
-            "students": per_student_list,
-            "charts": charts,
-        })
+    def __str__(self):
+        return f"{self.name} ({self.tokens} tokens)"
